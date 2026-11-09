@@ -1,0 +1,59 @@
+name: Windows client
+
+# 为什么在 GitHub 上打：pkg 要下载 node22-win-x64 的 base 二进制，
+# 而我们的自建服务器连不上 github.com（实测超时），npmmirror 也没有镜像
+# （/-/binary/yao-pkg/ → 404）。GitHub 自己的 runner 天然能访问。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'win-client/**'
+      - '.github/workflows/windows-client.yml'
+
+jobs:
+  build:
+    # windows-latest 是 x64，pkg 不需要交叉，也不会遇到 spawn ENOEXEC。
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pkg
+        working-directory: win-client
+        run: |
+          npm init -y | Out-Null
+          # into-stream 8 是纯 ESM，pkg 的 lib-es5 用 require 会炸；
+          # 锁 6.x 是唯一稳定的组合（本地实测过）。
+          npm install --no-audit --no-fund @yao-pkg/pkg
+          npm install --no-audit --no-fund into-stream@6
+          if (Test-Path node_modules\@yao-pkg\pkg\node_modules\into-stream) {
+            Remove-Item -Recurse -Force node_modules\@yao-pkg\pkg\node_modules\into-stream
+          }
+          New-Item -ItemType Directory -Force -Path node_modules\@yao-pkg\pkg\node_modules | Out-Null
+          Copy-Item -Recurse node_modules\into-stream node_modules\@yao-pkg\pkg\node_modules\into-stream
+
+      - name: Build exe
+        working-directory: win-client
+        run: |
+          npx pkg server.mjs --targets node22-win-x64 --output SigmaClient.exe
+          Get-Item SigmaClient.exe | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
+
+      - name: Smoke test
+        working-directory: win-client
+        run: |
+          # 起来 3 秒看它是否打印了地址和令牌，再杀掉。
+          # 只看「进程没立刻退出」——端口占用之类的环境差异不该判失败。
+          $p = Start-Process -FilePath .\SigmaClient.exe -PassThru -RedirectStandardOutput out.txt -RedirectStandardError err.txt
+          Start-Sleep -Seconds 4
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          Get-Content out.txt -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SigmaClient-exe
+          path: win-client/SigmaClient.exe
+          if-no-files-found: error
