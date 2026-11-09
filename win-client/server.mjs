@@ -21,6 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import net from 'node:net';
 import { execFile, spawn } from 'node:child_process';
 
 // pkg 打成 exe 后，任何未捕获异常都会让窗口一闪就没了，
@@ -59,6 +60,9 @@ const EMBEDDED_SCREEN_PS1 = "# Sigma \u5c4f\u5e55\u91c7\u96c6 \u2014\u2014 \u630
 const PORT = Number(process.env.SIGMA_WIN_PORT || 8092);
 const BEACON_PORT = Number(process.env.SIGMA_WIN_BEACON || 8099);
 const IS_WIN = process.platform === 'win32';
+// 内置中继地址：客户不用填，也不要求注册。
+// 想换成自己的中继，改 config.json 的 relay 字段即可。
+const DEFAULT_RELAY = 'ws://202.189.51.44:8791';
 
 // ── 配置：首次运行生成令牌 ────────────────────────────────────────────
 function loadConfig() {
@@ -77,6 +81,11 @@ function loadConfig() {
     allowExec: [],
     // 允许访问的根目录；默认是用户主目录。留空 = 不限制（不推荐）。
     roots: [os.homedir()],
+    // 中继：跨网络时用。空字符串 = 只用局域网。
+    relay: DEFAULT_RELAY,
+    // 配对码：固定下来便于「记住的设备」直接连；首次随机生成。
+    code: Array.from({ length: 6 }, () =>
+      'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[crypto.randomInt(32)]).join(''),
   };
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 });
   return cfg;
@@ -146,6 +155,141 @@ function lanAddresses() {
     }
   }
   return out;
+}
+
+// ── 中继隧道 ──────────────────────────────────────────────────────────
+//
+// 目的：电脑没有公网 IP 时，手机在外网也能连。
+//
+// 做法：主动出站连到中继（WebSocket），手机也连同一个中继，
+// 中继按配对码把两条连接对接。出站连接能穿任何 NAT，所以两边都不需要
+// 公网地址。
+//
+// 关键设计：进来的字节被当成**原始 TCP 流**喂给本机的 HTTP 服务。
+// 不解码、不重组——中继只做管道，这样分块传输、大文件、MJPEG 流
+// 全都能原样穿过，不需要为每种情况写特殊处理。
+
+let relayWS = null;
+let relayState = 'off';   // off | connecting | online | error
+let relayError = null;
+
+function connectRelay() {
+  const url = CONFIG.relay;
+  if (!url || relayState === 'connecting' || relayState === 'online') return;
+  if (typeof WebSocket === 'undefined') {
+    relayState = 'error';
+    relayError = '这个 Node 版本没有内置 WebSocket（需要 21+）';
+    console.log(`  中继    不可用：${relayError}`);
+    return;
+  }
+
+  relayState = 'connecting';
+  relayError = null;
+  let ws;
+  try { ws = new WebSocket(url); } catch (e) { relayState = 'error'; relayError = e.message; return; }
+  ws.binaryType = 'arraybuffer';
+
+  ws.addEventListener('open', () => {
+    ws.send(JSON.stringify({ role: 'host', code: CONFIG.code, meta: { name: CONFIG.name, platform: process.platform } }));
+  });
+
+  ws.addEventListener('message', (evt) => {
+    // ⚠ 关键：手机可能把 HTTP 请求当**文本帧**发过来（WebSocket 的 send(string)），
+    // 也可能当二进制帧。握手完成后所有文本都要当数据，不能只认二进制——
+    // 之前只处理二进制，文本帧进了 JSON.parse 失败就被静默丢掉，
+    // 表现是「配对了但一个字节都过不来」。
+    if (relayState === 'online' && typeof evt.data === 'string' && !evt.data.startsWith('{')) {
+      handleTunnelChunk(Buffer.from(evt.data, 'utf8'));
+      return;
+    }
+    if (typeof evt.data === 'string') {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'registered') {
+          relayState = 'online';
+          console.log(`  中继    已上线（配对码 ${CONFIG.code}）`);
+        }
+        if (msg.type === 'paired') {
+          console.log('\n  ✓ 手机已通过中继连上\n');
+          closeTunnel();
+          openTunnel();
+        }
+        if (msg.type === 'error') { relayState = 'error'; relayError = msg.message; }
+      } catch { /* 非 JSON 文本：当数据丢弃 */ }
+      return;
+    }
+    handleTunnelChunk(Buffer.from(evt.data));
+  });
+
+  ws.addEventListener('close', () => {
+    relayWS = null;
+    closeTunnel();
+    if (relayState === 'online' || relayState === 'connecting') {
+      relayState = 'off';
+      // 断了就重连：客户可能长时间开着，网络抖一下就永久失联太糟
+      setTimeout(connectRelay, 5000);
+    }
+  });
+
+  ws.addEventListener('error', (e) => {
+    relayState = 'error';
+    relayError = (e && e.message) || '连不上中继（网络被拦？）';
+    // 打出来：用户看不到的话，出问题只能干猜
+    console.log(`  中继    连接失败：${relayError}`);
+  });
+
+  relayWS = ws;
+}
+
+/**
+ * 隧道 → 本机 HTTP 的一条长连接。
+ *
+ * 之前每个数据块都新建一条 TCP，把块当成「完整请求」——错在两点：
+ *   1. 一个 HTTP 请求可能被拆成多个 WebSocket 消息
+ *   2. 一次 TCP 只能处理一个请求，客户端复用连接就废了
+ *
+ * 现在：配对成功后开一条 TCP，双向对接，来多少转多少。
+ * 不解析 HTTP，所以分块、长连接、MJPEG 流全都自然可用。
+ */
+let tunnelSock = null;
+
+function openTunnel() {
+  if (tunnelSock) return tunnelSock;
+  tunnelSock = net.connect(PORT, '127.0.0.1');
+  tunnelSock.setNoDelay(true);
+  // 手机那头断了就关掉这条，下次配对重开
+  tunnelSock.on('close', () => { tunnelSock = null; });
+  tunnelSock.on('error', () => { tunnelSock = null; });
+  tunnelSock.on('data', (d) => {
+    if (process.env.SIGMA_TUNNEL_DEBUG) console.log(`  隧道    → ${d.length} 字节回传`);
+    if (relayWS && relayWS.readyState === 1) {
+      // 转成 ArrayBuffer 发：中继按二进制原样转发
+      relayWS.send(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
+    }
+  });
+  return tunnelSock;
+}
+
+function closeTunnel() {
+  if (tunnelSock) { try { tunnelSock.destroy(); } catch { /* 已断 */ } tunnelSock = null; }
+}
+
+function handleTunnelChunk(buf) {
+  const sock = openTunnel();
+  if (!sock) { console.log('  隧道    没有连接，丢弃', buf.length, '字节'); return; }
+  if (process.env.SIGMA_TUNNEL_DEBUG) {
+    console.log(`  隧道    ← ${buf.length} 字节：${buf.subarray(0, 60).toString('utf8').replace(/\r\n/g, ' ')}`);
+  }
+  // 可能还没连上（connect 是异步的），排队等 ready
+  if (sock.connecting) {
+    sock.once('connect', () => { try { sock.write(buf); } catch { /* 已断 */ } });
+  } else {
+    try { sock.write(buf); } catch { /* 写失败，close 会兜 */ }
+  }
+}
+
+function renderBanner() {
+  // 由主流程统一打印，这里只更新状态
 }
 
 // ── 屏幕流（MJPEG） ───────────────────────────────────────────────────
@@ -438,15 +582,27 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  端口    ${PORT}`);
   for (const a of addrs) console.log(`  地址    http://${a}:${PORT}`);
   if (addrs.length === 0) console.log('  地址    (没检测到局域网地址，检查网络)');
-  console.log(`  配对码  ${pair}`);
+  // 这里的 pair 是令牌前 6 位，只用来让用户核对「手机上是同一个令牌」，
+  // 真正的跨网配对码在下面单独打印。
+  console.log(`  校验码  ${pair}`);
   console.log(`  令牌    ${CONFIG.token}`);
   console.log('');
   console.log(`  配置文件 ${CONFIG_PATH}`);
   console.log(`  命令执行 ${(CONFIG.allowExec || []).length ? '已启用：' + CONFIG.allowExec.join(', ') : '未启用（只读文件、查信息）'}`);
   console.log('');
+  if (CONFIG.relay) {
+    console.log(`  配对码  ${CONFIG.code}   ← 不在同一网络时，手机端填这个`);
+    console.log(`  中继    ${CONFIG.relay}`);
+  }
+  console.log('');
   console.log('  手机端：Sigma → 设置 → 远程电脑 → 填上面的地址和令牌');
+  console.log('         不在同一 Wi-Fi 时，改填「配对码」');
   console.log('  按 Ctrl+C 停止');
   console.log('');
+
+  // 本地服务起来之后再连中继：隧道的字节要转发到 PORT，
+  // 早连会让头几个请求打空。
+  if (CONFIG.relay) connectRelay();
   // 首次运行提示：这两个弹窗是客户最常卡住的地方，
   // 直接印在窗口里，比让他翻 README 有用。
   if (!CONFIG.seenTip) {
