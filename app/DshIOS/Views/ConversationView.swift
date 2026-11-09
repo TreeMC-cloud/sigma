@@ -126,6 +126,10 @@ struct ConversationView: View {
         let started = !blank && model.subagentAddress == nil && !(!model.loaded && app.sessions[sessionId]?.blank == true)
         ScrollViewReader { proxy in
             VStack(spacing: 0) {
+                // 电脑屏幕小窗：连上 Windows 客户端时出现在顶部，可折叠。
+                // 放在滚动区外——它是「持续观察的画面」，滚走就失去意义了。
+                PCScreenDock()
+
                 // 引擎重启打断了上一次任务：在时间线顶上挂一条，说清楚发生了什么。
                 // 放在滚动区外：它不该滚走，用户得先看见这个才明白为什么没有回答。
                 if let notice = model.interruptedNotice {
