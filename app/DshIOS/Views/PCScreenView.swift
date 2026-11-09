@@ -1,0 +1,329 @@
+import SwiftUI
+import UIKit
+
+/// 电脑屏幕小窗：拉 MJPEG 流，逐帧解成 UIImage 显示。
+///
+/// 为什么不用 AsyncImage：它是「请求一次拿一张图」，不支持
+/// `multipart/x-mixed-replace` 的持续流。这里的流是一条永不结束的
+/// HTTP 响应，每帧之间用边界分隔，必须自己按字节切。
+///
+/// 为什么不用 AVPlayer：MJPEG 不是视频容器格式，AVFoundation 不认。
+///
+/// 关键约束：**只在可见时拉流**。手机和电脑都在局域网，一直推流会同时
+/// 烧两边电量；`onDisappear` 里必须 stop，否则退出页面后还在后台收数据。
+struct PCScreenView: View {
+    let baseURL: String
+    let token: String
+
+    @State private var frame: UIImage?
+    @State private var status: Status = .idle
+    @State private var fps: Double = 0
+    @State private var receiver: MJPEGReceiver?
+
+    enum Status: Equatable {
+        case idle, connecting, live, failed(String)
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let frame {
+                Image(uiImage: frame)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                placeholder
+            }
+            // 右上角状态：让人知道「是在连」「在播」还是「挂了」
+            VStack {
+                HStack {
+                    Spacer()
+                    badge
+                }
+                Spacer()
+            }
+            .padding(6)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+        )
+        .onAppear(perform: start)
+        .onDisappear(perform: stop)
+    }
+
+    private var placeholder: some View {
+        VStack(spacing: 8) {
+            Image(systemName: status.icon)
+                .font(.system(size: 22, weight: .light))
+                .foregroundStyle(.white.opacity(0.5))
+            Text(status.text)
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.45))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 12)
+        }
+    }
+
+    private var badge: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(status == .live ? Color.green : Color.orange)
+                .frame(width: 6, height: 6)
+            if status == .live, fps > 0 {
+                Text(String(format: "%.0f fps", fps))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.75))
+            }
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(.black.opacity(0.45), in: Capsule())
+    }
+
+    private func start() {
+        guard receiver == nil else { return }
+        guard let url = URL(string: baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/screen") else {
+            status = .failed("地址不对")
+            return
+        }
+        status = .connecting
+        let r = MJPEGReceiver(url: url, token: token)
+        r.onFrame = { image in
+            // 主线程更新 UI；fps 用简单滑动平均，避免数字乱跳
+            DispatchQueue.main.async {
+                frame = image
+                status = .live
+                fps = fps == 0 ? r.currentFPS : fps * 0.8 + r.currentFPS * 0.2
+            }
+        }
+        r.onError = { message in
+            DispatchQueue.main.async {
+                status = .failed(message)
+                frame = nil
+            }
+        }
+        r.start()
+        receiver = r
+    }
+
+    private func stop() {
+        receiver?.stop()
+        receiver = nil
+        frame = nil
+        status = .idle
+        fps = 0
+    }
+}
+
+private extension PCScreenView.Status {
+    var text: String {
+        switch self {
+        case .idle: return "未连接"
+        case .connecting: return "连接中…"
+        case .live: return ""
+        case .failed(let m): return m
+        }
+    }
+    var icon: String {
+        switch self {
+        case .idle, .connecting: return "display"
+        case .live: return "display"
+        case .failed: return "exclamationmark.triangle"
+        }
+    }
+}
+
+/// MJPEG 接收器：按 `multipart/x-mixed-replace` 的边界切帧。
+///
+/// 边界取值不假设是 `--frame`：服务端可能带引号、可能用别的 token，
+/// 所以先从响应头 `boundary=` 里读出来，读不到才退回默认值。
+final class MJPEGReceiver: NSObject, URLSessionDataDelegate {
+    private let url: URL
+    private let token: String
+    private var session: URLSession!
+    private var task: URLSessionDataTask?
+
+    private var boundary: Data = Data("--frame".utf8)
+    private var buffer = Data()
+    private var framesThisSecond = 0
+    private var lastTick = Date()
+    private(set) var currentFPS: Double = 0
+
+    var onFrame: ((UIImage) -> Void)?
+    var onError: ((String) -> Void)?
+    private var stopped = false
+
+    init(url: URL, token: String) {
+        self.url = url
+        self.token = token
+        super.init()
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 15
+        // 流是长连接，别让系统因为「没有新字节」而超时掐断
+        cfg.timeoutIntervalForResource = .greatestFiniteMagnitude
+        session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+    }
+
+    func start() {
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        task = session.dataTask(with: req)
+        task?.resume()
+    }
+
+    func stop() {
+        stopped = true
+        task?.cancel()
+        session.invalidateAndCancel()
+    }
+
+    // MARK: URLSessionDataDelegate
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        if let http = response as? HTTPURLResponse {
+            if http.statusCode == 401 { onError?("令牌不对"); completionHandler(.cancel); return }
+            if http.statusCode != 200 { onError?("电脑返回 \(http.statusCode)"); completionHandler(.cancel); return }
+            if let ct = http.value(forHTTPHeaderField: "Content-Type"),
+               let range = ct.range(of: "boundary=") {
+                let b = ct[range.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: "\"; "))
+                if !b.isEmpty { boundary = Data(("--" + b).utf8) }
+            }
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        buffer.append(data)
+        extractFrames()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard !stopped else { return }
+        if let error {
+            let ns = error as NSError
+            if ns.code == NSURLErrorCancelled { return }
+            onError?("连接中断（\(ns.code)）")
+        } else {
+            onError?("电脑断开了连接")
+        }
+    }
+
+    /// 从 buffer 里切出完整帧。
+    ///
+    /// 格式：`--boundary\r\n...headers...\r\n\r\n<jpeg bytes>\r\n`
+    /// 我们只关心最后一个 `\r\n\r\n` 之后、下一个 boundary 之前的字节 —— 那就是 JPEG。
+    private func extractFrames() {
+        while true {
+            guard let start = buffer.range(of: boundary) else {
+                // 还没碰到边界：保留尾部一小段防止边界被切断
+                if buffer.count > 4 { buffer = buffer.suffix(4) }
+                return
+            }
+            // 丢掉边界之前的内容（可能是上次的尾巴）
+            buffer.removeSubrange(0..<start.upperBound)
+            // 找这一帧的头部结束位置
+            guard let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) else {
+                if buffer.count > 512 { buffer.removeAll() }   // 异常数据，别无限涨
+                return
+            }
+            let bodyStart = headerEnd.upperBound
+            // 找下一帧的边界
+            guard let next = buffer.range(of: boundary, in: bodyStart..<buffer.endIndex) else {
+                return  // 帧还没收完
+            }
+            var jpeg = buffer.subdata(in: bodyStart..<next.lowerBound)
+            // 去掉边界前的 \r\n
+            while jpeg.count >= 2, jpeg[jpeg.count-2] == 0x0D, jpeg[jpeg.count-1] == 0x0A {
+                jpeg.removeLast(2)
+            }
+            buffer.removeSubrange(0..<next.lowerBound)
+
+            if jpeg.count > 2, jpeg[0] == 0xFF, jpeg[1] == 0xD8, let img = UIImage(data: jpeg) {
+                tick()
+                onFrame?(img)
+            }
+        }
+    }
+
+    private func tick() {
+        framesThisSecond += 1
+        let now = Date()
+        let dt = now.timeIntervalSince(lastTick)
+        if dt >= 1 {
+            currentFPS = Double(framesThisSecond) / dt
+            framesThisSecond = 0
+            lastTick = now
+        }
+    }
+}
+
+/// 对话页顶部的可折叠小窗。
+///
+/// 三个状态：
+///   · 未连接 → 整块不出现（不占空间，不打扰）
+///   · 已连接但收起 → 一条细栏，点一下展开
+///   · 展开 → 16:9 的画面 + 收起按钮
+///
+/// 为什么不自动展开：用户可能只想聊天，不想每进一个会话就顶着一块视频。
+@MainActor
+struct PCScreenDock: View {
+    @Environment(PCLink.self) private var link
+    @State private var expanded = true
+    @State private var dismissed = false
+
+    var body: some View {
+        Group {
+            if link.isConfigured, !dismissed {
+                VStack(spacing: 0) {
+                    header
+                    if expanded {
+                        PCScreenView(baseURL: link.baseURL, token: link.token)
+                            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                            .padding(.horizontal, 10)
+                            .padding(.bottom, 8)
+                    }
+                }
+                .background(.ultraThinMaterial)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy(duration: 0.22), value: expanded)
+        .task { await link.probe() }
+    }
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "display")
+                .font(.caption)
+                .foregroundStyle(Palette.secondary)
+            Text(link.online == true ? "电脑屏幕" : "电脑离线")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(link.online == true ? Palette.ink : Palette.secondary)
+            if link.online == true {
+                Circle().fill(Palette.running).frame(width: 5, height: 5)
+            }
+            Spacer()
+            Button {
+                expanded.toggle()
+            } label: {
+                Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    .font(.caption2)
+                    .foregroundStyle(Palette.secondary)
+            }
+            Button {
+                dismissed = true
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption2)
+                    .foregroundStyle(Palette.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+}
