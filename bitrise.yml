@@ -1,0 +1,115 @@
+# bitrise.yml —— 备用构建通道（macOS）
+#
+# 为什么需要：GitHub 的 macOS runner 在公开仓库上实测「排队 15 分钟拿不到机器
+# 直接被取消」，而 Linux runner 2 秒就分到。构建 unsigned IPA 必须用 Xcode，
+# 所以需要一台别的 macOS。步骤与 .github/workflows/unsigned-ipa.yml 对齐，
+# 顺序不能改：nodejs-mobile → libgit2 → engine → xcodegen → xcodebuild → 打包。
+
+format_version: '13'
+default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
+
+app:
+  envs:
+    - CONFIGURATION: Release
+
+workflows:
+  unsigned_ipa:
+    steps:
+      - activate-ssh-key@4: {}
+      - git-clone@8: {}
+
+      - script@1:
+          title: 环境自检
+          inputs:
+            - content: |
+                #!/usr/bin/env bash
+                set -ex
+                xcodebuild -version
+                node --version || true
+                python3 --version
+
+      - script@1:
+          title: 拉 nodejs-mobile
+          inputs:
+            - content: |
+                #!/usr/bin/env bash
+                set -ex
+                chmod +x scripts/*.sh || true
+                ./scripts/fetch-nodejs-mobile.sh
+
+      - script@1:
+          title: 编译 libgit2
+          inputs:
+            - content: |
+                #!/usr/bin/env bash
+                set -ex
+                ./scripts/build-libgit2.sh
+
+      - script@1:
+          title: 组装引擎
+          inputs:
+            - content: |
+                #!/usr/bin/env bash
+                set -ex
+                ./scripts/build-engine.sh
+
+      - script@1:
+          title: 生成 Xcode 工程
+          inputs:
+            - content: |
+                #!/usr/bin/env bash
+                set -ex
+                cd app
+                xcodegen generate --quiet
+
+      - script@1:
+          title: 编译（未签名）
+          inputs:
+            - content: |
+                #!/usr/bin/env bash
+                set -eo pipefail
+                cd app
+                xcodebuild -project DshIOS.xcodeproj -scheme DshIOS \
+                  -configuration "$CONFIGURATION" \
+                  -sdk iphoneos -destination 'generic/platform=iOS' \
+                  -derivedDataPath build/DerivedData \
+                  -skipPackagePluginValidation \
+                  ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+                  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+                  build
+
+      - script@1:
+          title: 打包 IPA
+          inputs:
+            - content: |
+                #!/usr/bin/env bash
+                set -euo pipefail
+                cd app
+                APP="build/DerivedData/Build/Products/$CONFIGURATION-iphoneos/DshIOS.app"
+                test -d "$APP"
+                # 嵌进去的 framework 逐个 ad-hoc 重签，否则装到设备上 dyld 拒绝加载
+                find "$APP/Frameworks" -maxdepth 1 -name '*.framework' -type d 2>/dev/null | while read -r fw; do
+                  name=$(basename "$fw" .framework)
+                  [ -f "$fw/$name" ] && codesign --force --sign - --timestamp=none "$fw/$name" || true
+                  codesign --force --sign - --timestamp=none "$fw" || true
+                done
+                for ext in "$APP"/PlugIns/*.appex; do
+                  [ -d "$ext" ] || continue
+                  codesign --force --sign - --timestamp=none "$ext" || true
+                done
+                codesign --force --sign - --timestamp=none "$APP" || true
+                rm -rf build/Payload build/ipa
+                mkdir -p build/Payload build/ipa
+                cp -R "$APP" build/Payload/
+                cd build
+                zip -qry ipa/DshIOS-unsigned.ipa Payload
+                ls -lh ipa/
+                # 交给 Bitrise 收走
+                envman add --key IPA_PATH --value "$PWD/ipa/DshIOS-unsigned.ipa"
+
+      - deploy-to-bitrise-io@2: {}
+
+meta:
+  bitrise.io:
+    stack: osx-xcode-16.x
+    machine_type_id: g2-m1.4core
