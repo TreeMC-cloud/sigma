@@ -90,6 +90,8 @@ struct RootView: View {
                 if let app = connection.app {
                     MainView(session: session)
                         .environment(app)
+                        // 电脑连接配置：对话页顶部的小窗要用
+                        .environment(PCLink.shared)
                 } else {
                     StartupView(message: String(localized: "正在连接…"))
                 }
