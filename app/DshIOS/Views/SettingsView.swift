@@ -97,6 +97,9 @@ struct SettingsView: View {
 
                 Section {
                     NavigationLink { PluginsView() } label: { valueRow("插件", pluginCount.map { String(localized: "\($0) 个") } ?? "") }
+                    NavigationLink { RemotePCPage() } label: {
+                        valueRow("远程电脑", PCLink.shared.isConfigured ? "已连接" : "未连接")
+                    }
                     NavigationLink { SchedulesView(openSession: openSession) } label: { valueRow("自动化", app.scheduleCount.map { String(localized: "\($0) 个") } ?? "") }
                     // 能力地图原来是空会话页里的一块，有对话就永远看不到。
                     // 治理层做的事（任务、整理、技能、告警）需要常驻入口，放这里连同「插件／自动化」一起。
@@ -585,41 +588,5 @@ private struct EngineCard: View {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
         }
         return result == KERN_SUCCESS ? info.phys_footprint : nil
-    }
-}
-
-/// The tail of the engine's console log.
-private struct EngineLogView: View {
-    let file: URL
-    @State private var text = ""
-
-    var body: some View {
-        ScrollView {
-            Text(text.isEmpty ? String(localized: "（日志为空）") : text)
-                .font(.caption2.monospaced())
-                .foregroundStyle(Palette.ink)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(16)
-        }
-        .defaultScrollAnchor(.bottom)
-        .background(Palette.grouped)
-        .navigationTitle("引擎日志")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Button { load() } label: { Image(systemName: "arrow.clockwise") }.accessibilityLabel("刷新")
-                ShareLink(item: file)
-            }
-        }
-        .onAppear { load() }
-    }
-
-    private func load() {
-        guard let handle = try? FileHandle(forReadingFrom: file) else { return }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        try? handle.seek(toOffset: size > 96_000 ? size - 96_000 : 0)
-        text = String(decoding: handle.readDataToEndOfFile(), as: UTF8.self)
     }
 }
