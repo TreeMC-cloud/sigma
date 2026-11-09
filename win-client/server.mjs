@@ -252,6 +252,18 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('  手机端：Sigma → 设置 → 远程电脑 → 填上面的地址和令牌');
   console.log('  按 Ctrl+C 停止');
   console.log('');
+  // 首次运行提示：这两个弹窗是客户最常卡住的地方，
+  // 直接印在窗口里，比让他翻 README 有用。
+  if (!CONFIG.seenTip) {
+    console.log('  ┌─ 首次运行，请留意两件事 ─────────────────────┐');
+    console.log('  │ 1. 如果弹出「Windows 防火墙」，请勾选          │');
+    console.log('  │    「专用网络」并点「允许访问」，否则手机连不上 │');
+    console.log('  │ 2. 手机和这台电脑要在同一个 Wi-Fi 下           │');
+    console.log('  └───────────────────────────────────────────────┘');
+    console.log('');
+    CONFIG.seenTip = true;
+    try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(CONFIG, null, 2), { mode: 0o600 }); } catch { /* 写不了就每次都提示 */ }
+  }
 });
 
 // ── 局域网信标：手机不用手动输 IP ─────────────────────────────────────
