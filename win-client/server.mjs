@@ -21,10 +21,41 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+// pkg 打成 exe 后，任何未捕获异常都会让窗口一闪就没了，
+// 用户看到的是「双击闪退」，什么信息都没有。所以先装兜底：
+// 把原因写进 exe 同目录的 crash.log，并且**不退出**，留住窗口。
+const BOOT_DIR = typeof process.pkg !== 'undefined' ? path.dirname(process.execPath) : process.cwd();
+function crashLog(err) {
+  const text = `[${new Date().toISOString()}] ${err?.stack || err}\r\n`;
+  try { fs.appendFileSync(path.join(BOOT_DIR, 'crash.log'), text); } catch { /* 写不了就算了 */ }
+  try { console.error(text); } catch { /* 没有控制台 */ }
+}
+function keepWindow(why) {
+  try {
+    console.error('');
+    console.error(`  ${why}：程序没有退出，详细信息在 crash.log`);
+    console.error('  按 Ctrl+C 关闭窗口');
+  } catch { /* 没有控制台 */ }
+}
+process.on('uncaughtException', (e) => { crashLog(e); keepWindow('运行时错误'); });
+process.on('unhandledRejection', (e) => { crashLog(e); keepWindow('Promise 未处理'); });
+
+// pkg 打包成 exe 后，import.meta.url 指向 `/snapshot/...`（只读虚拟文件系统），
+// 往那里写 config.json 会抛 EROFS/EACCES —— 表现就是「双击闪退」。
+// 所以 exe 模式下必须用 process.execPath 的目录（即 exe 所在目录）。
+const PACKED = typeof process.pkg !== 'undefined';
+const HERE = PACKED
+  ? path.dirname(process.execPath)
+  : path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(HERE, 'config.json');
+
+// screen.ps1 的内容直接内嵌进源码：
+// pkg 的 asset 方案要额外的 assets 配置，容易漏；内嵌成字符串最稳，
+// exe 里一定拿得到。运行时写进临时目录再交给 PowerShell。
+const EMBEDDED_SCREEN_PS1 = "# Sigma \u5c4f\u5e55\u91c7\u96c6 \u2014\u2014 \u6301\u7eed\u8f93\u51fa JPEG \u5e27\u5230 stdout\n#\n# \u4e3a\u4ec0\u4e48\u7528 PowerShell \u800c\u4e0d\u662f Node \u76f4\u63a5\u622a\u56fe\uff1a\n#   Node \u6ca1\u6709\u5185\u7f6e\u7684\u5c4f\u5e55\u6355\u83b7\u80fd\u529b\uff0c\u8981\u505a\u5c31\u5f97\u7f16\u8bd1 node-addon \u6216\u8005\u4f9d\u8d56\u539f\u751f\u6a21\u5757\uff0c\n#   \u800c\u5ba2\u6237\u7aef\u7684\u8bbe\u8ba1\u524d\u63d0\u662f\u300c\u96f6\u4f9d\u8d56\u3001\u5355\u6587\u4ef6 exe\u300d\u3002PowerShell \u5728\u6240\u6709 Windows \u4e0a\n#   \u90fd\u81ea\u5e26\uff0c.NET \u7684 System.Drawing \u80fd\u76f4\u63a5\u6293\u5c4f\u3002\n#\n# \u4e3a\u4ec0\u4e48\u662f**\u5e38\u9a7b\u8fdb\u7a0b**\u800c\u4e0d\u662f\u6bcf\u6b21\u8c03\u7528\uff1a\n#   \u6bcf\u6b21\u8d77\u4e00\u4e2a PowerShell \u8fdb\u7a0b\u8981 200-400ms\uff0c\u6700\u591a 3 \u5e27/\u79d2\uff1b\n#   \u5e38\u9a7b\u5faa\u73af\u80fd\u8fbe\u5230 10-15 \u5e27/\u79d2\uff0c\u8fd9\u624d\u662f\u300c\u89c6\u9891\u300d\u800c\u4e0d\u662f\u300c\u5e7b\u706f\u7247\u300d\u3002\n#\n# \u8f93\u51fa\u534f\u8bae\uff1a\u6bcf\u5e27\u524d\u6253\u5370 `--FRAME <\u5b57\u8282\u6570>`\uff0c\u7136\u540e\u5199\u539f\u59cb JPEG \u5b57\u8282\u3002\n#   \u7528\u957f\u5ea6\u524d\u7f00\u800c\u4e0d\u662f\u5206\u9694\u7b26\uff1aJPEG \u6570\u636e\u91cc\u4ec0\u4e48\u5b57\u8282\u90fd\u53ef\u80fd\u6709\uff0c\n#   \u5206\u9694\u7b26\u4f1a\u88ab\u8bef\u5224\uff0c\u957f\u5ea6\u524d\u7f00\u4e0d\u4f1a\u3002\n\nparam(\n  [int]$Fps = 12,\n  [int]$Quality = 55,\n  [double]$Scale = 0.5   # \u7f29\u5c0f\u4e00\u534a\uff1a1080p\u2192960x540\uff0c\u6d41\u91cf\u964d\u5230 1/4\uff0c\u8089\u773c\u770b\u76d1\u63a7\u591f\u7528\n)\n\n$ErrorActionPreference = 'Stop'\nAdd-Type -AssemblyName System.Drawing, System.Windows.Forms\n\n$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen\n$srcW = $bounds.Width\n$srcH = $bounds.Height\n$dstW = [int]($srcW * $Scale)\n$dstH = [int]($srcH * $Scale)\n\n$bmp = New-Object System.Drawing.Bitmap($srcW, $srcH)\n$gfx = [System.Drawing.Graphics]::FromImage($bmp)\n$small = New-Object System.Drawing.Bitmap($dstW, $dstH)\n$smallGfx = [System.Drawing.Graphics]::FromImage($small)\n$smallGfx.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::Bilinear\n\n$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |\n  Where-Object { $_.MimeType -eq 'image/jpeg' }\n$ep = New-Object System.Drawing.Imaging.EncoderParameters(1)\n$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter(\n  [System.Drawing.Imaging.Encoder]::Quality, [long]$Quality)\n\n# \u544a\u8bc9\u7236\u8fdb\u7a0b\u300c\u6211\u51c6\u5907\u597d\u4e86\u300d\uff0c\u9644\u4e0a\u771f\u5b9e\u5206\u8fa8\u7387\n[Console]::Out.WriteLine(\"--READY $dstW $dstH $Fps\")\n[Console]::Out.Flush()\n\n$stdout = [Console]::OpenStandardOutput()\n$interval = [int](1000 / [Math]::Max(1, $Fps))\n\nwhile ($true) {\n  $t0 = [Environment]::TickCount\n\n  try {\n    $gfx.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bmp.Size)\n    $smallGfx.DrawImage($bmp, 0, 0, $dstW, $dstH)\n\n    $ms = New-Object System.IO.MemoryStream\n    $small.Save($ms, $codec, $ep)\n    $bytes = $ms.ToArray()\n    $ms.Dispose()\n\n    $header = [Text.Encoding]::ASCII.GetBytes(\"--FRAME $($bytes.Length)`n\")\n    $stdout.Write($header, 0, $header.Length)\n    $stdout.Write($bytes, 0, $bytes.Length)\n    $stdout.Flush()\n  } catch {\n    # \u9501\u5c4f\u3001UAC \u63d0\u6743\u754c\u9762\u3001\u5207\u6362\u7528\u6237\u65f6\u4f1a\u6293\u4e0d\u5230\u753b\u9762\u3002\n    # \u62a5\u544a\u4e00\u6b21\u9519\u8bef\u4f46\u7ee7\u7eed\u8dd1\uff1a\u7528\u6237\u89e3\u9501\u540e\u753b\u9762\u4f1a\u81ea\u52a8\u6062\u590d\u3002\n    $msg = [Text.Encoding]::ASCII.GetBytes(\"--ERROR $($_.Exception.Message)`n\")\n    $stdout.Write($msg, 0, $msg.Length)\n    $stdout.Flush()\n  }\n\n  # \u6309\u76ee\u6807\u5e27\u7387\u8865\u9f50\u95f4\u9694\uff0c\u907f\u514d\u6293\u591a\u5feb\u5c31\u53d1\u591a\u5feb\uff08\u90a3\u4f1a\u5360\u6ee1 CPU\uff09\n  $elapsed = [Environment]::TickCount - $t0\n  $sleep = $interval - $elapsed\n  if ($sleep -gt 0) { Start-Sleep -Milliseconds $sleep }\n}\n";
+
 const PORT = Number(process.env.SIGMA_WIN_PORT || 8092);
 const BEACON_PORT = Number(process.env.SIGMA_WIN_BEACON || 8099);
 const IS_WIN = process.platform === 'win32';
@@ -115,6 +146,108 @@ function lanAddresses() {
     }
   }
   return out;
+}
+
+// ── 屏幕流（MJPEG） ───────────────────────────────────────────────────
+//
+// 为什么用 MJPEG 而不是 H.264：
+//   客户端是零依赖的 Node 单文件，做 H.264 就得打包 ffmpeg（+80MB）或者
+//   写 node-addon。MJPEG 就是连续的 JPEG 帧，PowerShell 抓屏直接出 JPEG，
+//   不需要任何编码器；iOS 的 UIImage/AsyncImage 也能逐帧解。
+//   代价是流量大 3-5 倍，但局域网无所谓，而且只在你打开预览时才推。
+//
+// 生命周期：第一个观看者连上才启动 PowerShell，最后一个断开就杀掉。
+//   不让它常驻——没人看的时候一直抓屏是白烧 CPU 和电。
+
+let screenProc = null;
+let screenInfo = null;      // { w, h, fps }
+let screenClients = new Set();
+let screenFrame = null;     // 最近一帧，新连接立刻有画面
+let screenErr = null;
+
+function ensureScreen() {
+  if (screenProc) return screenProc;
+  const ps = process.env.SIGMA_SCREEN_SHELL || (IS_WIN ? 'powershell.exe' : 'pwsh');
+  // screen.ps1 的取法有两种：
+  //   · exe 模式：pkg 把它作为 asset 打进了虚拟文件系统，从 __dirname 读
+  //   · 源码模式：就在同目录
+  // 之前只认磁盘文件，exe 里当然找不到 —— 一点「屏幕预览」就抛错。
+  const script = process.env.SIGMA_SCREEN_SCRIPT || path.join(HERE, 'screen.ps1');
+  let scriptPath = script;
+  if (!fs.existsSync(script)) {
+    // 退一步：把内置副本写到临时目录再用（PowerShell -File 需要真实路径）
+    const tmp = path.join(os.tmpdir(), `sigma-screen-${process.pid}.ps1`);
+    try {
+      fs.writeFileSync(tmp, EMBEDDED_SCREEN_PS1, 'utf8');
+      scriptPath = tmp;
+    } catch {
+      throw new Error('缺少 screen.ps1，且无法写入临时目录');
+    }
+  }
+
+
+  // 参数顺序有讲究：
+  //   Windows 的 powershell -File 后面**不能再跟任何 - 开头的开关**，否则它会把
+  //   参数当成 powershell 自己的开关（实测报 `illegal option -N`，因为 -NoProfile
+  //   被当成了脚本参数）。所以 -NoProfile / -ExecutionPolicy 必须放在 -File 前面。
+  //   非 Windows（测试用）走 sh，参数是另一套。
+  const args = process.env.SIGMA_SCREEN_SCRIPT
+    ? [scriptPath]
+    : ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath,
+       '-Fps', String(CONFIG.screenFps || 12),
+       '-Quality', String(CONFIG.screenQuality || 55),
+       '-Scale', String(CONFIG.screenScale || 0.5)];
+
+  const child = spawn(ps, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  let buf = Buffer.alloc(0);
+  let need = -1;
+
+  child.stdout.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    for (;;) {
+      if (need < 0) {
+        const nl = buf.indexOf(0x0a);
+        if (nl < 0) return;
+        const line = buf.subarray(0, nl).toString('ascii').trim();
+        buf = buf.subarray(nl + 1);
+        if (line.startsWith('--FRAME ')) {
+          need = Number(line.slice(8)) || 0;
+        } else if (line.startsWith('--READY ')) {
+          const [, w, h, fps] = line.split(' ');
+          screenInfo = { w: Number(w), h: Number(h), fps: Number(fps) };
+        } else if (line.startsWith('--ERROR ')) {
+          screenErr = line.slice(8);
+        } else if (line.trim() === '') {
+          // 空行：继续，不要退化成「等数据」的状态
+          continue;
+        }
+        // 关键：解析完一行必须继续循环，否则当缓冲里已经带了
+        // 帧头（--FRAME N）+ 完整帧时，会停在这里等下一次 data 事件，
+        // 而那一帧其实已经在 buf 里了 —— 表现为「一直没画面」。
+        continue;
+      } else {
+        if (buf.length < need) return;
+        screenFrame = buf.subarray(0, need);
+        buf = buf.subarray(need);
+        need = -1;
+        for (const res of screenClients) res.write(screenFrame, () => {});
+      }
+    }
+  });
+
+  child.stderr.on('data', (d) => { screenErr = String(d).slice(0, 300); });
+  child.on('exit', () => { screenProc = null; });
+  screenProc = child;
+  return child;
+}
+
+function stopScreenIfIdle() {
+  if (screenClients.size === 0 && screenProc) {
+    try { screenProc.kill(); } catch { /* 已退出 */ }
+    screenProc = null;
+    screenFrame = null;
+    screenInfo = null;
+  }
 }
 
 // ── 能力 ──────────────────────────────────────────────────────────────
@@ -219,6 +352,54 @@ const server = http.createServer(async (req, res) => {
 
     if (route === 'info') { json(res, 200, { ok: true, data: await CAPS.info() }); return; }
 
+    // ── MJPEG 流 ──
+    // 边界不用随机串：固定值即可，因为我们每帧都自带 Content-Length，
+    // 客户端按长度读，不靠边界切分。
+    if (route === 'screen') {
+      try {
+        ensureScreen();
+      } catch (e) {
+        json(res, 503, { ok: false, error: String(e.message) });
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': 'multipart/x-mixed-replace; boundary=frame',
+        'cache-control': 'no-store, no-cache, must-revalidate',
+        connection: 'close',
+        'access-control-allow-origin': '*',
+      });
+      screenClients.add(res);
+      // 新连接先给最后一帧，避免等 1/fps 秒才看到画面
+      if (screenFrame) res.write(screenFrame, () => {});
+      req.on('close', () => { screenClients.delete(res); stopScreenIfIdle(); });
+      return;
+    }
+
+    // 单帧快照：App 里做「点一下看一眼」时用，不需要开流
+    if (route === 'screen/one') {
+      try {
+        ensureScreen();
+      } catch (e) {
+        json(res, 503, { ok: false, error: String(e.message) });
+        return;
+      }
+      const deadline = Date.now() + 5000;
+      while (!screenFrame && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 80));
+      }
+      if (!screenFrame) { json(res, 504, { ok: false, error: screenErr || '抓不到画面（可能锁屏了）' }); return; }
+      res.writeHead(200, { 'content-type': 'image/jpeg', 'content-length': screenFrame.length,
+        'cache-control': 'no-store', 'access-control-allow-origin': '*' });
+      res.end(screenFrame);
+      return;
+    }
+
+    if (route === 'screen/meta') {
+      json(res, 200, { ok: true, data: { streaming: !!screenProc, viewers: screenClients.size,
+        info: screenInfo, error: screenErr } });
+      return;
+    }
+
     if (req.method !== 'POST') { json(res, 405, { ok: false, error: '只支持 POST' }); return; }
 
     const body = await readBody(req);
@@ -230,6 +411,20 @@ const server = http.createServer(async (req, res) => {
   } catch (error) {
     json(res, 400, { ok: false, error: String(error?.message || error) });
   }
+});
+
+server.on('error', (e) => {
+  console.error('');
+  if (e.code === 'EADDRINUSE') {
+    // 用户开了两个客户端是最常见的启动失败。说清楚怎么处理，
+    // 别只丢一个 EADDRINUSE 给非技术用户。
+    console.error(`  端口 ${PORT} 已被占用：可能已经有一个客户端在运行了。`);
+    console.error('  关掉另一个窗口，或设环境变量 SIGMA_WIN_PORT 换端口。');
+  } else {
+    console.error(`  启动失败：${e.message}`);
+  }
+  crashLog(e);
+  keepWindow('启动失败');
 });
 
 server.listen(PORT, '0.0.0.0', () => {
