@@ -320,6 +320,46 @@ pc.mjs ps "Get-ItemProperty HKLM:\...\Uninstall\* | ? DisplayName -like '*X*'"  
 
 **「退出码 0」不等于「装好了」**，最后那步确认不能省。
 
+## 第一次连上就写「机器画像」
+
+真机日志里，同一台机器被问了两次显卡、三次内存——因为这些信息
+每次都是现查的，从没落下来。
+
+**第一次连上（或换了新电脑）时，一次性采集，写进项目记忆：**
+
+```sh
+pc.mjs ps "\$c=Get-CimInstance Win32_ComputerSystem; \$v=Get-CimInstance Win32_VideoController | Select-Object -First 1; \$o=Get-CimInstance Win32_OperatingSystem; \$d=Get-PSDrive C; Write-Output (\"HOST=\$env:COMPUTERNAME\"); Write-Output (\"CPU=\$(\$c.NumberOfLogicalProcessors) 核\"); Write-Output (\"RAM=\$([math]::Round(\$c.TotalPhysicalMemory/1GB)) GB\"); Write-Output (\"GPU=\$(\$v.Name)\"); Write-Output (\"SCREEN=\$(\$v.CurrentHorizontalResolution)x\$(\$v.CurrentVerticalResolution)\"); Write-Output (\"OS=\$(\$o.Caption)\"); Write-Output (\"DISK_C_FREE=\$([math]::Round(\$d.Free/1GB)) GB\")"
+```
+
+然后用 `memory_remember` 记一条 **project 级** 的：
+
+```
+<主机名> · CPU 8核 · RAM 17GB · GPU AMD Radeon Graphics（集显，无 CUDA）
+· 屏幕 2560x1288 · Windows Server 2022 · C 盘剩余 93GB
+```
+
+**之后所有「这台机器能不能跑 X」的问题，先查这条记忆，不要再 `Get-CimInstance`。**
+
+### 什么时候重采
+
+- 换了电脑（主机名变了）
+- 用户说「我换显卡了」之类
+- 记忆里没有这台机器的记录
+
+**别每次对话都重查。** 那是纯浪费——一次 200ms 的 PowerShell
+外加一段上下文，换来的信息一秒都没变。
+
+### 画像里该有什么
+
+| 项 | 为什么重要 |
+|---|---|
+| CPU 核心数 | 决定渲染并发 |
+| 内存 | 决定能不能跑 Blender/Chrome |
+| **显卡型号 + 是不是集显** | 决定能不能 GPU 渲染、跑不跑得动模型 |
+| 屏幕分辨率 | 截图和鼠标坐标要用 |
+| 磁盘剩余 | 装软件前先看 |
+| **有没有 CUDA / ROCm** | AI 相关任务的前提 |
+
 ## 你没有眼睛，用这些代替
 
 **当前模型不支持图像输入**——`read_image` 会直接报错：
