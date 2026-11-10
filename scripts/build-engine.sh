@@ -156,6 +156,13 @@ else:
     print('engine: WARN anchor or meow-memory missing, skip injection')
 PYINJECT
 
+# ---- 给 meow-memory 打补丁：让本会话写入的记忆能在后续轮次注入 ----
+# 不改的话，模型踩坑→写 lesson→下一轮读不到→再踩同一个坑（真机上连犯 3 次）。
+# 补丁幂等，重复构建不会重复改。
+if [ -f "$src/patches/meow-same-session.mjs" ]; then
+  node "$src/patches/meow-same-session.mjs" "$out" || echo "engine: WARN meow 补丁失败（继续构建）"
+fi
+
 after=$(du -sk "$nm" | cut -f1)
 echo "engine: $out ($((before/1024)) MB -> $((after/1024)) MB)"
 
