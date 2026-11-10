@@ -320,6 +320,35 @@ pc.mjs ps "Get-ItemProperty HKLM:\...\Uninstall\* | ? DisplayName -like '*X*'"  
 
 **「退出码 0」不等于「装好了」**，最后那步确认不能省。
 
+## 你没有眼睛，用这些代替
+
+**当前模型不支持图像输入**——`read_image` 会直接报错：
+`model does not declare image input`。真机上为此浪费了 7 次调用。
+
+想确认「界面/状态对不对」时，别截图，用这些：
+
+| 想知道 | 用什么 |
+|---|---|
+| 软件开没开 | `pc.mjs ps "Get-Process <名字> -EA SilentlyContinue"` |
+| 装好了没 | 查注册表 `HKLM:\...\Uninstall\*` 里有没有那个 DisplayName |
+| 下载完了没 | `pc.mjs wait file_stable <路径>` |
+| 按钮在哪 / 点了会怎样 | `pc.mjs ps` 跑 UI Automation 读控件树（Name/ControlType/AutomationId） |
+| 页面加载了没 | 读窗口标题：`Get-Process msedge | Select MainWindowTitle` |
+| 程序内部报错 | 读它自己的日志文件（`%APPDATA%\<厂商>\*.log`） |
+| 磁盘/内存够不够 | `Get-PSDrive` / `Get-CimInstance Win32_OperatingSystem` |
+
+**看得见不等于看懂了。** 与其截图交给用户猜，不如把「我确认了 A 是 B」
+写成一句人话——那才是用户要的。
+
+### 截图仍然有用，但用法不同
+
+`pc.mjs shot` 只返回**路径、尺寸、字节数**，不返回画面内容。它能用来：
+
+- 判断「画面变没变」（字节数剧变 = 界面换了）
+- 交给用户看（配 `pull` + `present`）
+
+**不要指望自己看懂它。**
+
 ## 验证：做完要比对，不是发出去就算
 
 一条指令执行完，必须**确认结果真的发生了**：
