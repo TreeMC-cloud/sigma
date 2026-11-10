@@ -268,6 +268,25 @@ try {
     console.log(`已取回 ${remote}`);
     console.log(`→ ${out}（${(buf.length/1048576).toFixed(2)} MB${d.truncated ? '，已截断' : ''}）`);
     console.log(`minis://attachments/${name}`);
+  } else if (cmd === 'wait') {
+    // 通用等待原语。任何「等它做完」的场景都用这个，不要 sleep。
+    //   wait file_exists <路径>
+    //   wait file_stable <路径>          ← 下载完
+    //   wait file_size <路径> --min N
+    //   wait process_gone <名字或PID>
+    //   wait process_alive <名字或PID>
+    //   wait custom "<PowerShell 表达式>"
+    const kind = pos[0];
+    const target = pos[1];
+    if (!kind || !target) throw new Error('用法：wait <kind> <target> [--min N] [--timeout ms]');
+    const d = await call(need(), 'wait', {
+      kind, target,
+      min: Number(arg('--min') || 0),
+      timeoutMs: Number(arg('--timeout') || 110000),
+    }, 120000);
+    const secs = (d.waitedMs / 1000).toFixed(1);
+    if (d.met) console.log(`✅ 已满足（等了 ${secs} 秒）· ${d.detail}`);
+    else { console.log(`⚠️ 超时未满足（等了 ${secs} 秒）· ${d.detail}`); process.exitCode = 2; }
   } else if (cmd === 'psfile') {
     // 从本地 .ps1 文件读脚本发过去执行。
     //
