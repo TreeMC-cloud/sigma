@@ -134,6 +134,68 @@ print('颜色数', len(np.unique(im.reshape(-1,3), axis=0)))  # 几百=纯色块
 
 或者用户明确指定的路径。
 
+## 第一件事：选对渲染引擎
+
+真机日志里最贵的一个错误：在**集显机器上用 Cycles**，然后花十几轮
+调采样数（128 → 64 → 48）想提速。方向错了——引擎的差距是数量级的，
+参数只能救回一点。
+
+### 怎么选
+
+```python
+import bpy
+# 先看有没有可用的 GPU 计算设备
+prefs = bpy.context.preferences.addons['cycles'].preferences
+prefs.refresh_devices()
+gpus = [d for d in prefs.devices if d.type != 'CPU']
+has_cuda = any(d.type == 'CUDA' for d in gpus)
+has_optix = any(d.type == 'OPTIX' for d in gpus)
+```
+
+| 硬件 | 引擎 | 理由 |
+|---|---|---|
+| **集显 / 虚拟显卡 / 无独显** | **EEVEE** | Cycles 只能 CPU 软算，慢 10–50 倍 |
+| NVIDIA + CUDA/OptiX | Cycles | 硬件光追，质量最好 |
+| AMD 独显 + HIP | Cycles | 可用但生态弱 |
+| 要真实焦散 / 次表面散射 | Cycles | EEVEE 做不到 |
+
+**集显上不要用 Cycles，除非用户明确要求光追效果。**
+
+### 切换命令
+
+```python
+sc = bpy.context.scene
+sc.render.engine = 'BLENDER_EEVEE_NEXT'   # Blender 4.2+
+# 或 'BLENDER_EEVEE'（4.1 及更早）
+
+# EEVEE 的关键参数：采样数 32–64 就够，TAA 抗锯齿
+sc.eevee.taa_render_samples = 32
+# 开启屏幕空间反射/环境光遮蔽补偿没有光追的损失
+sc.eevee.use_ssr = True
+sc.eevee.use_gtao = True
+```
+
+### 如果用户必须要 Cycles（要质感）
+
+那就要接受慢，并把预期说清楚：
+
+```python
+sc.cycles.device = 'CPU'
+sc.cycles.samples = 32            # 集显机器 32 起步，别 128
+sc.render.resolution_percentage = 50   # 先出一半分辨率看构图
+```
+
+**先出 480p 低采样预览给用户确认构图，再跑全质量。**
+不要一上来就 1080p/128 采样跑一小时。
+
+### 真机教训
+
+用户问「为什么 GPU 占用很低」——答案是**集显 + Cycles = 纯 CPU 渲染**，
+GPU 本来就不参与。当时模型去跑了 2 分钟 benchmark 才得出这个结论，
+而机器画像里早就有「AMD Radeon Graphics（集显）」。
+
+**看到集显就选 EEVEE，不要先跑基准测试再说。**
+
 ## 渲染前先估算时间
 
 ```python
