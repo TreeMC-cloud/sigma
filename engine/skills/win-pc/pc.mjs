@@ -208,7 +208,10 @@ try {
     const url = pos[0];
     if (!url) throw new Error('用法：download <url> [保存路径]');
     const d = await call(need(), 'download', { url, path: pos[1] || null });
-    console.log(`已下载 ${d.path}（${(d.bytes/1048576).toFixed(1)} MB，${(d.ms/1000).toFixed(0)} 秒）`);
+    // 后台任务：立刻返回 jobId，不再谎报「已下载」
+    console.log(`已开始下载 → job ${d.jobId}`);
+    console.log(`保存到 ${d.path}`);
+    console.log(`查进度：pc.mjs download-status ${d.jobId}`);
   } else if (cmd === 'download-status') {
     const jobId = pos[0];
     if (!jobId) throw new Error('用法：download-status <jobId>');
@@ -219,6 +222,13 @@ try {
   } else if (cmd === 'downloads') {
     const d = await call(need(), 'downloads', {});
     for (const j of d.jobs) console.log(`${j.id} ${j.status} ${(j.bytes/1048576).toFixed(1)}MB ${j.path}`);
+  } else if (cmd === 'shot' || cmd === 'screenshot') {
+    // 截一张全屏图，返回路径 + 尺寸 + 字节数。
+    // 模型不支持图像输入，所以「看图」这条路走不通——
+    // 但尺寸和字节数能判断「界面变没变」，路径也能给用户看。
+    const d = await call(need(), 'input', { action: 'screenshot', text: pos[0] || '' });
+    console.log(`已截图 ${d.path}`);
+    console.log(`${d.width}x${d.height} · ${(d.bytes/1024).toFixed(0)} KB`);
   } else if (cmd === 'audit') {
     const cfg = need();
     const url = cfg.url.replace(/\/+$/, '') + '/audit?n=' + (arg('--n') || 20);
