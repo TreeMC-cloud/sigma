@@ -22,6 +22,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
+import dgram from 'node:dgram';
 import { execFile, spawn } from 'node:child_process';
 
 // pkg 打成 exe 后，任何未捕获异常都会让窗口一闪就没了，
@@ -419,6 +420,9 @@ class Mutex {
 const inputLock = new Mutex();
 const readLock = new Mutex();
 
+/** 下载任务表：jobId -> { id, url, path, status, bytes, error, startedAt } */
+const downloadJobs = new Map();
+
 // ── 卡键看门狗 ────────────────────────────────────────────────────────
 //
 // 为什么必须有：input 支持 keydown/click-down 这类「按下不松」的操作。
@@ -561,7 +565,7 @@ function stopScreenIfIdle() {
  * 提成模块级函数最稳。
  */
 async function doInput({ action, x = 0, y = 0, button = 'left', text = '', keys = '', delta = 0, moveMs = 0 } = {}) {
-    const ALLOWED = ['move', 'click', 'dblclick', 'down', 'up', 'scroll', 'type', 'key', 'keydown', 'keyup', 'release_all', 'screen', 'pos'];
+    const ALLOWED = ['move', 'click', 'dblclick', 'down', 'up', 'scroll', 'type', 'key', 'keydown', 'keyup', 'release_all', 'screenshot', 'screen', 'pos'];
     if (!ALLOWED.includes(action)) throw new Error(`不支持的动作：${action}`);
 
     const ps = IS_WIN ? 'powershell.exe' : 'pwsh';
@@ -709,7 +713,14 @@ const CAPS = {
       // 有需要确认的程序，或者 stdout 编码不对导致管道阻塞。
       // 加 `/q`（不回显）+ 显式把 stdin 关掉（stdio ignore）能避免。
       // 实测：不加这两条时，经中继的 exec 请求 25 秒也不回。
-      const args = win ? ['/d', '/q', '/s', '/c', command] : ['-c', command];
+      // Windows 的 cmd 对首尾引号有特殊处理：`cmd /c "start http://x"` 会把
+      // 引号一起交给被启动的程序，浏览器就收到一个带引号的 URL。
+      // 统一剥掉最外层成对的引号。
+      let cmdText = command;
+      if (win && cmdText.length > 1 && cmdText.startsWith('"') && cmdText.endsWith('"')) {
+        cmdText = cmdText.slice(1, -1);
+      }
+      const args = win ? ['/d', '/q', '/s', '/c', cmdText] : ['-c', cmdText];
       execFile(file, args, {
         cwd: cwd ? safePath(cwd) : os.homedir(),
         timeout: Math.min(Number(timeoutMs) || 60000, 300000),
@@ -768,48 +779,85 @@ const CAPS = {
   },
 
   /**
-   * 下载文件到磁盘。给「装软件」这类任务用。
+   * 在**电脑上**下载文件。手机只下命令，不传数据。
    *
-   * 为什么不直接用 exec 调 curl/Invoke-WebRequest：
-   *   大文件会让整个 HTTP 请求等很久，容易撞上中继超时。
-   *   这里改成**后台下载 + 立即返回**，agent 可以过一会儿查进度。
+   * 关键设计：**立刻返回，不等待下载完成**。
+   * 之前写成同步等待，200MB 的安装包要下几分钟，那个 HTTP 请求就会
+   * 一直挂着，最后被中继/客户端超时掐断——它看起来像「网络不行」，
+   * 实际是我们的接口设计错了。
    *
-   * @param url      下载地址
-   * @param path     存到哪（默认 Downloads 下按 URL 猜文件名）
+   * 现在：启动后台下载 → 立刻返回 jobId → agent 过几秒查 /download/status。
+   * 下载本身完全由电脑完成（电脑有自己的网络，不经过手机）。
    */
-  async download({ url, path = null, timeoutMs = 600000 } = {}) {
+  async download({ url, path: p = null } = {}) {
     if (!url || typeof url !== 'string') throw new Error('缺少 url');
-    const name = path || path.join(os.homedir(), 'Downloads',
+    const name = p || path.join(os.homedir(), 'Downloads',
       (url.split('/').pop() || 'download.bin').split('?')[0]);
     const dest = safePath(name);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
 
-    const started = Date.now();
-    if (IS_WIN) {
-      // Start-BitsTransfer 断点续传、后台、系统级，比 Invoke-WebRequest 稳
-      const ps = `$ProgressPreference='SilentlyContinue';` +
-        `Start-BitsTransfer -Source '${url.replace(/'/g, "''")}' -Destination '${dest.replace(/'/g, "''")}'`;
-      const r = await new Promise((resolve) => {
-        execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-          '-OutputFormat', 'Text', '-EncodedCommand',
-          Buffer.from(ps, 'utf16le').toString('base64')],
-          { timeout: Math.min(timeoutMs, 900000), windowsHide: true, maxBuffer: 1024 * 1024 },
-          (err, stdout, stderr) => resolve({ ok: !err, err: err?.message, stderr: String(stderr || '') }));
-      });
-      const size = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
-      audit({ kind: 'download', url: url.slice(0, 200), path: dest, size, ok: r.ok });
-      if (!r.ok) throw new Error(`下载失败：${r.err || r.stderr || '未知'}`);
-      return { ok: true, path: dest, bytes: size, ms: Date.now() - started };
-    }
+    const jobId = 'dl' + Date.now().toString(36);
+    downloadJobs.set(jobId, { id: jobId, url: url.slice(0, 300), path: dest,
+      status: 'running', startedAt: Date.now(), bytes: 0, error: null });
 
-    // 非 Windows（测试/其他平台）：用 PowerShell 或 curl
-    return await new Promise((resolve, reject) => {
-      execFile('curl', ['-sSL', '-o', dest, url],
-        { timeout: Math.min(timeoutMs, 900000) }, (err) => {
-          if (err) return reject(new Error('下载失败：' + err.message));
-          resolve({ ok: true, path: dest, bytes: fs.statSync(dest).size, ms: Date.now() - started });
-        });
-    });
+    // 后台跑，不 await
+    (async () => {
+      const job = downloadJobs.get(jobId);
+      try {
+        if (IS_WIN) {
+          // BITS：断点续传、后台、系统级。比 Invoke-WebRequest 稳。
+          // 很多下载站（含 qqdl.gtimg.cn）会拒掉没有 UA 的请求，直接 403。
+          // BITS 不支持自定义 UA，改用 Invoke-WebRequest。
+          const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+            + '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+          const ps = `$ProgressPreference='SilentlyContinue';`
+            + `$ErrorActionPreference='Stop';`
+            + `Invoke-WebRequest -Uri '${url.replace(/'/g, "''")}' `
+            + `-OutFile '${dest.replace(/'/g, "''")}' `
+            + `-UserAgent '${ua}' -UseBasicParsing -MaximumRedirection 5`;
+          await new Promise((resolve, reject) => {
+            execFile('powershell.exe',
+              ['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-OutputFormat','Text',
+               '-EncodedCommand', Buffer.from(ps,'utf16le').toString('base64')],
+              { timeout: 1800000, windowsHide: true, maxBuffer: 1024*1024 },
+              (err, so, se) => err ? reject(new Error(String(se||err.message).slice(0,300))) : resolve());
+          });
+        } else {
+          await new Promise((resolve, reject) => {
+            execFile('curl', ['-sSL', '-o', dest, url], { timeout: 1800000 },
+              (err) => err ? reject(err) : resolve());
+          });
+        }
+        job.status = 'done';
+        job.bytes = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+        job.finishedAt = Date.now();
+        audit({ kind: 'download', url: job.url, path: dest, size: job.bytes, ok: true });
+      } catch (e) {
+        job.status = 'failed';
+        job.error = String(e?.message || e).slice(0, 300);
+        job.finishedAt = Date.now();
+        audit({ kind: 'download', url: job.url, path: dest, ok: false, error: job.error });
+      }
+    })();
+
+    return { ok: true, jobId, status: 'running', path: dest,
+             hint: '下载在电脑上进行，用 /download/status?jobId=xxx 查进度' };
+  },
+
+  /** 查下载进度。 */
+  async downloadStatus({ jobId } = {}) {
+    const job = downloadJobs.get(String(jobId || ''));
+    if (!job) throw new Error('没有这个任务：' + jobId);
+    // 运行中顺便报一下当前文件大小（BITS 是边写边增长）
+    if (job.status === 'running' && fs.existsSync(job.path)) {
+      try { job.bytes = fs.statSync(job.path).size; } catch {}
+    }
+    return job;
+  },
+
+  /** 列出所有下载任务。 */
+  async downloads() {
+    return { count: downloadJobs.size, jobs: [...downloadJobs.values()].slice(-20) };
   },
 
   async ps({ script, timeoutMs = 120000 } = {}) {
@@ -880,7 +928,7 @@ const server = http.createServer(async (req, res) => {
         roots: (CONFIG.roots || []).length === 0 ? 'ALL_DRIVES' : (CONFIG.roots || []),
         powershell: true, batch: true,
         input: ['move', 'click', 'dblclick', 'down', 'up', 'scroll', 'type',
-                'key', 'keydown', 'keyup', 'release_all', 'foreground', 'focus'],
+                'key', 'keydown', 'keyup', 'release_all', 'screenshot', 'foreground', 'focus'],
         safety: ['watchdog_30s', 'release_all', 'expect_hwnd_guard'],
         concurrency: 'dual-lock (input / read)',
         dpiAware: IS_WIN,
