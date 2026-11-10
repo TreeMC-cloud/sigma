@@ -528,6 +528,13 @@ ctx.effect(() => {
               // 非派活工具：走编辑预检（只对会改文件的工具生效）
               // 被截断过的文件不许直接编辑：模型看到的是首尾拼接版，
               // 中间那段它没有，old_str 要么匹配不上，要么匹配到错误位置。
+              // 盲等拦截：sleep >= 10 秒直接拒绝。
+              // 之前只在结果出来后发一条提醒，模型完全无视——
+              // 真机日志里提醒发了，sleep 15/20/25/45 照样连着来。
+              // 提醒是建议，拒绝才是约束。
+              const blind = this.blockBlindWait(call);
+              if (blind) return blind;
+
               const stale = this.staleTruncation(call);
               if (stale) return stale;
               const blocked = this.precheckEdit(call);
@@ -1506,6 +1513,35 @@ ctx.effect(() => {
     }
     if (typeof event?.data?.result === 'string') return event.data.result;
     return '';
+  }
+
+  /**
+   * 拦截 `sleep N`（N >= 10）。
+   *
+   * 真机反复出现：`sleep 60; ps Get-Process` —— 盲等一分钟，
+   * 中间发生什么完全不知道。可能第 3 秒就成了，也可能第 3 秒就报错。
+   *
+   * 短 sleep（<10s）放行：那是正常节奏控制，不是盲等。
+   */
+  blockBlindWait(call) {
+    try {
+      const name = String(call?.name ?? call?.tool ?? '');
+      if (name !== 'bash' && name !== 'shell') return null;
+      const args = call?.arguments ?? call?.args ?? {};
+      const cmd = String(args.command ?? '');
+      const m = cmd.match(/\bsleep\s+(\d+)/);
+      if (!m) return null;
+      const secs = Number(m[1]);
+      if (!Number.isFinite(secs) || secs < 10) return null;
+      return `不建议 sleep ${secs} 秒盲等。`
+        + `等 60 秒期间可能第 3 秒就完成了，也可能第 3 秒就失败了——你都不知道。\n`
+        + `改成：先发起动作，然后每 2-3 秒看一次结果：\n`
+        + `  · 查进程：pc.mjs ps "Get-Process *xxx*"\n`
+        + `  · 查文件：pc.mjs ps "Get-Item <path> | Select Length"\n`
+        + `  · 截图：pc.mjs shot（存临时目录，不会弄脏桌面）\n`
+        + `  · 下载进度：pc.mjs download-status <jobId>\n`
+        + `确实需要等待时，sleep 不要超过 5 秒。`;
+    } catch { return null; }
   }
 
   onToolResult(session, event) {
