@@ -56,49 +56,47 @@ node "$DSH_TOOLS/win-pc/pc.mjs" connect --code <配对码> --token <令牌>
 | **快捷键** | `pc.mjs key "CTRL+V"` / `key "ALT+TAB"` / `key "ENTER"` |
 | **查做过什么** | `pc.mjs audit --n 20` |
 
-## 常见任务的正确做法
+## 怎么想问题
 
-### 找资料
-```sh
-pc.mjs ps "Get-ChildItem -Path C:\\Users -Recurse -Include *.pdf,*.docx -ErrorAction SilentlyContinue | Where LastWriteTime -gt (Get-Date).AddDays(-30) | Select FullName,Length,LastWriteTime | Format-Table -Auto"
-```
-**先缩小范围再看结果**，别一上来 `Get-ChildItem C:\ -Recurse`——那会跑几分钟。
+**别问「我有什么工具」，问「人在这台电脑前会怎么做」。**
 
-### 装软件
-```sh
-pc.mjs ps "winget install --id Google.Chrome -e --silent --accept-package-agreements"
-```
-或者下载安装包后静默安装。**装之前问用户一句**。
+人找文件会先想「大概在哪个盘」，然后一层层看；你就 `Get-ChildItem` 带范围找。
+人装软件会去官网下载双击；你就 `winget` 或下载后静默安装。
+人在微信发消息会点开窗口、点输入框、打字、回车；你就 `mouse click` + `type` + `key ENTER`。
+人要截图会按 Win+Shift+S；你就调 PowerShell 抓屏。
 
-### 发文件
-没有直接的发文件 API，用两步：
-```sh
-pc.mjs read "~/报告.pdf"      # 取回内容（文本）
-pc.mjs run "copy \\"~/报告.pdf\\" \\"D:\\共享\\""   # 或在电脑上转到别处
-```
-大文件走 `run` 调用 PowerShell 上传到网盘/发邮件更实际。
+**没有现成路子时，PowerShell 几乎什么都能办：**
 
-### 在微信里聊天
-这条路**能用但不稳**：
-```sh
-pc.mjs run "start weixin://"                    # 打开微信
-pc.mjs mouse click 200 300                      # 点某个会话
-pc.mjs type "你好"                              # 打字
-pc.mjs key "ENTER"                              # 发送
-```
-问题：**坐标依赖当前窗口位置和分辨率**，换个屏幕尺寸就点歪。
-更稳的做法是让用户自己描述界面，或者用 PowerShell 调 UI Automation：
-```sh
-pc.mjs ps "Add-Type -AssemblyName UIAutomationClient; ..."
-```
-**先做一次截图确认位置，再点。**
+| 想做的事 | 用什么 |
+|---|---|
+| 操作界面元素 | UI Automation（`UIAutomationClient`） |
+| 改系统设置 | 注册表 / `Set-ItemProperty` |
+| 调 Office 文档 | COM（`New-Object -ComObject Word.Application`） |
+| 发邮件 | `Send-MailMessage` 或 Outlook COM |
+| 压缩解压 | `Compress-Archive` |
+| 下载 | `Invoke-WebRequest` |
+| 定时/计划 | `Register-ScheduledTask` |
+| 看进程/端口 | `Get-Process` / `Get-NetTCPConnection` |
+| 管理系统服务 | `Get-Service` / `Start-Service` |
+| 查数据库 | `Invoke-Sqlcmd` 或 ADO.NET |
 
-### 跑渲染
-```sh
-pc.mjs run "cd D:\\project && npm run build"
-pc.mjs batch "cd D:\\project" "npm install" "npm run render"
-```
-长任务用 `--timeout 300000`。
+**写一段临时 PowerShell 就跑，不用怕「技能里没写」。** 那正是 `ps` 命令存在的意义。
+
+## 几个容易踩的坑
+
+**找文件别全盘扫。** `Get-ChildItem C:\ -Recurse` 能跑十分钟。
+先问用户大概在哪，或者从 `~`、`Desktop`、`Documents`、`Downloads` 开始。
+
+**点鼠标前先截图确认。** 坐标依赖分辨率和窗口位置，
+凭记忆点必歪。先 `screen/one` 看一眼，算好坐标再点。
+
+**装软件前问一句。** 装了什么会改系统状态，用户可能不想装。
+
+**长任务用大 timeout。** 编译、渲染、下载可能几分钟，
+`--timeout 300000`，并且告诉用户「正在跑，大概 X 分钟」。
+
+**命令卡住多半在等输入。** 加 `/y`、`-Force`、`--yes` 这类参数；
+或者用 `ps` 而不是 `run`（PowerShell 不读 stdin 的概率低一些）。
 
 ## 三条铁律
 
