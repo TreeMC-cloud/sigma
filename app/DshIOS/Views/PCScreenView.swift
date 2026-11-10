@@ -158,18 +158,16 @@ final class MJPEGReceiver: NSObject {
     var onError: ((String) -> Void)?
     /// 写一行诊断日志。
     ///
-    /// 为什么不用 `Diagnostics.shared.record`：那是 MainActor 隔离的，
-    /// 而 URLSession 回调在后台线程，编译期会报
-    /// 「call to main actor-isolated instance method in a synchronous nonisolated context」。
-    /// 这里走 nonisolated 的 appendLine，任何线程都能调。
-    // Swift 6 的严格并发检查不允许「可变 static」。
-    // 这两个只用于日志计数，竞争最多让数字差一，用 nonisolated(unsafe) 标注意图。
-    nonisolated(unsafe) fileprivate static var counter = 0
-    nonisolated(unsafe) fileprivate static var frames = 0
-    nonisolated fileprivate static func log(_ text: String) {
-        let url = EnginePaths.real(EnginePaths.shared + "/app.log")
+    /// 不用 `Diagnostics.shared.record`：那是 MainActor 隔离的，而这里在后台线程。
+    /// 不用 static：Swift 6 对可变 static 的严格并发检查会让编译失败。
+    /// 改成实例方法 + 实例计数器，任何线程都能调，也没有并发标注的坑。
+    private var reqCount = 0
+    private var frameCount = 0
+
+    private func log(_ text: String) {
         let stamp = ISO8601DateFormatter().string(from: Date())
-        Diagnostics.appendLine("[\(stamp)] 屏幕 · \(text)", to: url)
+        let path = EnginePaths.real(EnginePaths.shared + "/app.log")
+        Diagnostics.appendLine("[\(stamp)] 屏幕 · \(text)", to: path)
     }
 
     private var stopped = false
@@ -185,7 +183,7 @@ final class MJPEGReceiver: NSObject {
     func start() {
         stop()
         stopped = false
-        Self.log("开始轮询 \(url.absoluteString)")
+        log("开始轮询 \(url.absoluteString)")
         // 立刻拉一次，别让用户等
         tick()
         let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
@@ -202,7 +200,7 @@ final class MJPEGReceiver: NSObject {
     private func tick() {
         guard !stopped, !inFlight else { return }
         inFlight = true
-        Self.log("请求 #\(Self.counter += 1)")
+        log("请求 #\(reqCount += 1)")
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
         // 单个请求短超时：一帧拿不到就跳过一次，绝不拖住整个循环
@@ -218,38 +216,38 @@ final class MJPEGReceiver: NSObject {
             if let e = err {
                 let ns = e as NSError
                 if ns.code != NSURLErrorCancelled {
-                    Self.log("失败 \(ns.code)：\(ns.localizedDescription)")
+                    log("失败 \(ns.code)：\(ns.localizedDescription)")
                     self.onError?("第 \(ns.code) 号错误：\(ns.localizedDescription)")
                 }
                 return
             }
             guard let http = resp as? HTTPURLResponse else {
-                Self.log("不是 HTTP 响应")
+                log("不是 HTTP 响应")
                 return
             }
             if http.statusCode == 401 {
-                Self.log("401 令牌不对")
+                log("401 令牌不对")
                 self.onError?("令牌不对")
                 return
             }
             guard http.statusCode == 200 else {
-                Self.log("状态码 \(http.statusCode)")
+                log("状态码 \(http.statusCode)")
                 self.onError?("电脑返回 \(http.statusCode)")
                 return
             }
             guard let data else {
-                Self.log("200 但无数据")
+                log("200 但无数据")
                 return
             }
             guard let img = UIImage(data: data) else {
                 let head = data.prefix(16).map { String(format: "%02x", $0) }.joined()
-                Self.log("解码失败 \(data.count) 字节，头 \(head)")
+                log("解码失败 \(data.count) 字节，头 \(head)")
                 return
             }
 
-            Self.frames += 1
-            if Self.frames <= 3 || Self.frames % 40 == 0 {
-                Self.log("收到第 \(Self.frames) 帧 \(data.count) 字节")
+            frameCount += 1
+            if frameCount <= 3 || frameCount % 40 == 0 {
+                log("收到第 \(frameCount) 帧 \(data.count) 字节")
             }
             DispatchQueue.main.async {
                 guard !self.stopped else { return }
