@@ -36,6 +36,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path node_modules\@yao-pkg\pkg\node_modules | Out-Null
           Copy-Item -Recurse node_modules\into-stream node_modules\@yao-pkg\pkg\node_modules\into-stream
 
+      - name: 校验内嵌脚本与磁盘文件一致
+        shell: bash
+        working-directory: win-client
+        run: |
+          # 运行时用的是内嵌常量，改磁盘 .ps1 不同步等于没改。
+          # 真机上为此白跑四轮，这个门禁必须留着。
+          node check-embedded.mjs
+
       - name: Build exe
         working-directory: win-client
         run: |
