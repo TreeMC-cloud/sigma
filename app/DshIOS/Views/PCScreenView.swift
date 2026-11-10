@@ -55,6 +55,14 @@ struct PCScreenView: View {
         )
         .onAppear(perform: start)
         .onDisappear(perform: stop)
+        // App 切到后台时必须停：iOS 会冻结定时器，但 TCP 请求会挂在那里，
+        // 回前台后一堆过期请求同时完成，画面会跳。
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didEnterBackgroundNotification)) { _ in stop() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.willEnterForegroundNotification)) { _ in
+            if !stopped { start() }
+        }
     }
 
     private var placeholder: some View {
@@ -193,7 +201,9 @@ final class MJPEGReceiver: NSObject {
         log("开始轮询 \(url.absoluteString)")
         // 立刻拉一次，别让用户等
         tick()
-        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
+        // 500ms（2fps）。0.25s 时真机一天跑出 1800+ 次请求，
+        // 每次都穿过中继打到电脑上；2fps 已经足够看出「画面在不在动」。
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }
