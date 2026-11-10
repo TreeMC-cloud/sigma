@@ -98,6 +98,53 @@ function parseFrames(buf) {
   return [out, buf.subarray(off)];
 }
 
+/**
+ * 把一段完整的 HTTP 请求送进隧道，等响应回来写进 res。
+ *
+ * 为什么用「一请求一连接」而不是复用：中继要同时服务多个 App 请求，
+ * 复用会让响应互相串。每个请求临时占用 host 一次，简单可靠。
+ */
+function proxyThrough(hostSocket, rawRequest, res) {
+  const st = hostSocket.__st;
+  if (!st || st.closed) { res.writeHead(502); res.end('电脑断开了'); return; }
+
+  let chunks = [];
+  const onData = (buf) => {
+    chunks.push(buf.toString('latin1'));
+    const all = chunks.join('');
+    // 判断响应结束：Content-Length 到齐，或 chunked 的结束块
+    const sep = all.indexOf('\r\n\r\n');
+    if (sep < 0) return;
+    const headers = all.slice(0, sep);
+    const m = /content-length:\s*(\d+)/i.exec(headers);
+    const bodyStart = sep + 4;
+    if (m) {
+      const need = Number(m[1]);
+      if (Buffer.byteLength(all.slice(bodyStart), 'latin1') < need) return;
+    } else if (!/transfer-encoding:\s*chunked/i.test(headers)) {
+      // 没有长度也没有 chunked：以连接关闭为准，这里没法等，只能等超时
+    } else if (!all.slice(bodyStart).includes('\r\n0\r\n')) {
+      return;
+    }
+    cleanup();
+    const raw = Buffer.from(all, 'latin1');
+    const sp = raw.indexOf('\r\n');
+    const status = Number((raw.slice(0, sp).toString().split(' ')[1]) || 200);
+    res.writeHead(status, { 'content-type': (/(?:^|\r\n)content-type:\s*([^\r\n]+)/i.exec(headers) || [,'application/octet-stream'])[1].trim() });
+    res.end(raw.slice(bodyStart));
+  };
+
+  const timer = setTimeout(() => { cleanup(); if (!res.writableEnded) { res.writeHead(504); res.end('电脑没响应'); } }, 20000);
+  function cleanup() {
+    clearTimeout(timer);
+    st.extraData = null;
+  }
+
+  st.extraData = onData;
+  try { hostSocket.write(frame(rawRequest, 0x2)); }
+  catch { cleanup(); res.writeHead(502); res.end('转发失败'); }
+}
+
 // ── 状态 ──────────────────────────────────────────────────────────────
 function pruneCodes() {
   const now = Date.now();
@@ -134,7 +181,38 @@ function noteFail(ip) {
 }
 
 // ── 服务器 ────────────────────────────────────────────────────────────
+function json(res, code, body) {
+  const data = Buffer.from(JSON.stringify(body));
+  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'content-length': data.length });
+  res.end(data);
+}
+
 const server = http.createServer((req, res) => {
+  // ── 给 App 用的 HTTP 入口 ──
+  // App 只要填 http://<中继>:8791/c/<配对码>/... 就能跨网访问电脑，
+  // 不需要在 Swift 里实现 WebSocket 隧道。中继把这次 HTTP 请求
+  // 塞进隧道，等 host 的响应回传后原样返回。
+  if (req.url.startsWith('/c/')) {
+    const rest = req.url.slice(3);
+    const slash = rest.indexOf('/');
+    const code = (slash < 0 ? rest : rest.slice(0, slash)).toUpperCase();
+    const pathPart = slash < 0 ? '/' : rest.slice(slash);
+    const h = hosts.get(code);
+    if (!h) { json(res, 404, { ok: false, error: '没有这个配对码' }); return; }
+
+    // 把请求体读完再发，避免 body 还没到就转发
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const body = Buffer.concat(chunks);
+      const head = `${req.method} ${pathPart} HTTP/1.1\r\n`
+        + Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n')
+        + '\r\n\r\n';
+      proxyThrough(h.socket, Buffer.concat([Buffer.from(head), body]), res);
+    });
+    return;
+  }
+
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, hosts: hosts.size, stat, at: new Date().toISOString() }));
@@ -199,6 +277,8 @@ function attach(socket) {
       // 已配对：字节原样转给对面。不解析——host 上是 HTTP，
       // 我们只当管道，任何解析都会引入新问题。
       stat.framesIn += 1;
+      // HTTP 入口的响应：交给等待中的请求
+      if (st.extraData) { st.extraData(f.payload); continue; }
       if (st.peer) {
         stat.framesFwd += 1;
         if (stat.sample.length < 8) {
@@ -247,7 +327,8 @@ function attach(socket) {
           st.role = 'client';
           st.code = c;
           bind(h.socket);
-          hosts.delete(c);
+          // 不删 host：允许同一个配对码被反复使用（HTTP 入口每次请求都会来一次）。
+          // 但同一时刻只保留一个 peer——上一个断了在 close 里清。
           sendText({ type: 'paired', meta: h.meta });
           try {
             h.socket.__st && (h.socket.__st.peer = socket);
