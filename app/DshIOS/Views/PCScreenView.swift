@@ -200,7 +200,8 @@ final class MJPEGReceiver: NSObject {
     private func tick() {
         guard !stopped, !inFlight else { return }
         inFlight = true
-        log("请求 #\(reqCount += 1)")
+        reqCount += 1
+        log("请求 #\(reqCount)")
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
         // 单个请求短超时：一帧拿不到就跳过一次，绝不拖住整个循环
