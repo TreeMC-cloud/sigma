@@ -884,6 +884,77 @@ const CAPS = {
   },
 
   /** 查下载进度。 */
+  /**
+   * 通用「等到某件事发生」原语。
+   *
+   * 为什么必须有它：模型没有等待能力时，只能 `sleep 60; 查一下; sleep 20; 再查`，
+   * 真机日志里同一件事猜了 60/20/75 秒三次。有了 wait，一次请求就能
+   * 「阻塞到条件成立或超时」，模型不需要猜时间。
+   *
+   * kind：
+   *   file_exists  target=路径           文件出现即返回
+   *   file_stable  target=路径           文件大小连续两次不变（下载完）
+   *   file_size    target=路径 min=字节   文件达到指定大小
+   *   process_gone target=进程名或PID     进程退出
+   *   process_alive target=进程名或PID    进程出现
+   *   custom       target=PowerShell 表达式，返回 $true 即成立
+   *
+   * 返回 { ok, met, waitedMs, detail }。met=false 表示等到超时还没成立——
+   * 这时候模型该改方案，而不是继续等。
+   */
+  async wait({ kind, target, min = 0, timeoutMs = 110000, intervalMs = 1000 } = {}) {
+    const KINDS = ['file_exists', 'file_stable', 'file_size',
+                   'process_gone', 'process_alive', 'custom'];
+    if (!KINDS.includes(kind)) throw new Error(`kind 必须是 ${KINDS.join('/')}`);
+    if (!target) throw new Error('缺少 target');
+
+    // 单次最长 110 秒：中继超时是 120 秒，留 10 秒余量。
+    // 更长的等待应该分多次调用——每次都会带回现场，比盲等一小时强。
+    const budget = Math.min(Number(timeoutMs) || 110000, 110000);
+    const interval = Math.max(200, Math.min(Number(intervalMs) || 1000, 10000));
+    const started = Date.now();
+
+    let lastSize = -1;
+    const probe = async () => {
+      if (kind === 'custom') {
+        const r = await this.ps({ script: `if (${target}) { 'YES' } else { 'NO' }`, timeoutMs: 15000 });
+        return { met: String(r.stdout || '').includes('YES'), detail: String(r.stdout || '').trim() };
+      }
+      if (kind === 'process_gone' || kind === 'process_alive') {
+        const q = /^\d+$/.test(String(target))
+          ? `Get-Process -Id ${target} -ErrorAction SilentlyContinue`
+          : `Get-Process -Name '${String(target).replace(/\.exe$/i,'')}' -ErrorAction SilentlyContinue`;
+        const r = await this.ps({ script: `if (${q}) { 'YES' } else { 'NO' }`, timeoutMs: 15000 });
+        const alive = String(r.stdout || '').includes('YES');
+        return { met: kind === 'process_gone' ? !alive : alive, detail: alive ? 'running' : 'not running' };
+      }
+      // 文件类
+      const abs = safePath(target);
+      if (!fs.existsSync(abs)) {
+        lastSize = -1;
+        return { met: kind === 'process_gone', detail: 'missing' };
+      }
+      const st = fs.statSync(abs);
+      if (kind === 'file_exists') return { met: true, detail: `${st.size} bytes` };
+      if (kind === 'file_size') return { met: st.size >= Number(min), detail: `${st.size}/${min}` };
+      // file_stable：两次间隔内大小不变，且不为 0
+      const same = st.size === lastSize && st.size > 0;
+      lastSize = st.size;
+      return { met: same, detail: `${st.size} bytes` };
+    };
+
+    let detail = '';
+    while (Date.now() - started < budget) {
+      try {
+        const r = await probe();
+        detail = r.detail;
+        if (r.met) return { ok: true, met: true, waitedMs: Date.now() - started, detail };
+      } catch (e) { detail = String(e.message || e); }
+      await new Promise((r) => setTimeout(r, interval));
+    }
+    return { ok: true, met: false, waitedMs: Date.now() - started, detail };
+  },
+
   async downloadStatus({ jobId } = {}) {
     const job = downloadJobs.get(String(jobId || ''));
     if (!job) throw new Error('没有这个任务：' + jobId);
