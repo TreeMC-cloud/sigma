@@ -204,6 +204,11 @@ try {
     if (!text) throw new Error('用法：type "要打的字"');
     const d = await call(need(), 'input', { action: 'type', text });
     console.log(JSON.stringify(d));
+  } else if (cmd === 'download') {
+    const url = pos[0];
+    if (!url) throw new Error('用法：download <url> [保存路径]');
+    const d = await call(need(), 'download', { url, path: pos[1] || null });
+    console.log(`已下载 ${d.path}（${(d.bytes/1048576).toFixed(1)} MB，${(d.ms/1000).toFixed(0)} 秒）`);
   } else if (cmd === 'audit') {
     const cfg = need();
     const url = cfg.url.replace(/\/+$/, '') + '/audit?n=' + (arg('--n') || 20);
