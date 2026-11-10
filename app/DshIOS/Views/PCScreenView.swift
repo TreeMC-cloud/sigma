@@ -26,11 +26,15 @@ struct PCScreenView: View {
 
     var body: some View {
         ZStack {
+            // 用 16:10 做占位高度（多数笔记本的比例），图片来了会自己顶开
             Color.black
             if let frame {
                 Image(uiImage: frame)
                     .resizable()
+                    // .fit = 完整显示、不裁切；配合外层给的高度上限，
+                    // 宽高比完全由图片自己决定（16:10 / 4:3 / 21:9 都不会变形）
                     .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: 320)
             } else {
                 placeholder
             }
@@ -273,8 +277,10 @@ struct PCScreenDock: View {
                 VStack(spacing: 0) {
                     header
                     if expanded {
+                        // ⚠ 不要硬写 16:9：用户的电脑可能是 16:10、4:3、超宽屏。
+                        // 写死比例会把画面裁掉一部分——真机上表现为「只显示屏幕一角」。
+                        // 交给 PCScreenView 内部按图像真实比例自行决定高度。
                         PCScreenView(baseURL: link.effectiveBase, token: link.token)
-                            .aspectRatio(16.0 / 9.0, contentMode: .fit)
                             .padding(.horizontal, 10)
                             .padding(.bottom, 8)
                     }
