@@ -201,7 +201,14 @@ function resolveEmbedded(name, content) {
   const beside = path.join(HERE, name);
   if (fs.existsSync(beside)) return beside;
   const tmp = path.join(os.tmpdir(), `sigma-${process.pid}-${name}`);
-  if (!fs.existsSync(tmp)) fs.writeFileSync(tmp, content, 'utf8');
+  if (!fs.existsSync(tmp)) {
+    // ⚠ 必须写 BOM。
+    // Windows PowerShell 5.1 读 .ps1 时，没有 BOM 就按**系统 ANSI 代码页**
+    // （中文机是 GBK）解析。我们的脚本是 UTF-8，于是里面每一个中文字面量
+    // 都会在**加载阶段**就变成乱码——用 SendKeys 打出来当然也是乱码。
+    // 加 BOM（EF BB BF）后 PowerShell 才认它是 UTF-8。
+    fs.writeFileSync(tmp, '\uFEFF' + content, 'utf8');
+  }
   return tmp;
 }
 
@@ -663,11 +670,22 @@ const CAPS = {
     };
   },
 
+  /**
+   * 写文件。
+   *
+   * encoding='base64' 时按二进制落盘——传图片、PDF、zip 必须走这条，
+   * 否则内容会被当文本写坏。
+   */
   async write({ path: p, content = '', encoding = 'utf8' } = {}) {
     const abs = safePath(p);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(abs, content, encoding);
-    return { path: abs, bytes: Buffer.byteLength(content, encoding) };
+    if (encoding === 'base64') {
+      const buf = Buffer.from(String(content), 'base64');
+      fs.writeFileSync(abs, buf);
+      return { path: abs, bytes: buf.length, encoding: 'base64' };
+    }
+    fs.writeFileSync(abs, String(content), 'utf8');
+    return { path: abs, bytes: Buffer.byteLength(String(content), 'utf8'), encoding: 'utf8' };
   },
 
   /**
@@ -739,6 +757,8 @@ const CAPS = {
       if (win && cmdText.length > 1 && cmdText.startsWith('"') && cmdText.endsWith('"')) {
         cmdText = cmdText.slice(1, -1);
       }
+      // 中文输出同理：先 chcp 65001 再跑，否则 GBK 输出会被当 UTF-8 解成乱码
+      if (win) cmdText = 'chcp 65001 >nul 2>&1 & ' + cmdText;
       const args = win ? ['/d', '/q', '/s', '/c', cmdText] : ['-c', cmdText];
       execFile(file, args, {
         cwd: cwd ? safePath(cwd) : os.homedir(),
@@ -882,8 +902,17 @@ const CAPS = {
   async ps({ script, timeoutMs = 120000 } = {}) {
     if (!script || typeof script !== 'string') throw new Error('缺少 script');
     const ps = IS_WIN ? 'powershell.exe' : 'pwsh';
-    // -EncodedCommand 避免所有引号/换行问题
-    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    // ⚠ 中文乱码的根因：Windows PowerShell 默认用系统代码页（中文机是 GBK/936）
+    // 输出到 stdout，而 Node 按 UTF-8 解码 —— 于是「确定」变成「ȷ��」。
+    // 在脚本最前面强制切到 UTF-8，一劳永逸。
+    // 同时把输入输出编码都设好，避免 UI Automation 读出来的中文也是乱的。
+    const header = IS_WIN
+      ? "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+        + "$OutputEncoding=[System.Text.Encoding]::UTF8;"
+        + "$PSDefaultParameterValues['*:Encoding']='utf8';"
+      : "";
+    // -EncodedCommand 避免所有引号/换行问题（UTF-16LE base64，与系统代码页无关）
+    const encoded = Buffer.from(header + script, 'utf16le').toString('base64');
     const started = Date.now();
     const result = await new Promise((resolve) => {
       execFile(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
