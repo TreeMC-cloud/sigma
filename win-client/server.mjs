@@ -639,14 +639,28 @@ const CAPS = {
     return { path: abs, count: items.length, items: items.slice(0, 500) };
     }); },
 
-  async read({ path: p, maxBytes = 256 * 1024 } = {}) {
+  /**
+   * 读文件。
+   *
+   * base64=true 时按二进制读并编码——取截图、取构建产物必须走这条，
+   * 否则 `readFileSync(abs,'utf8')` 会把 PNG/zip 变成一堆乱码。
+   */
+  async read({ path: p, maxBytes = 256 * 1024, base64 = false } = {}) {
     const abs = safePath(p);
     const stat = fs.statSync(abs);
     if (!stat.isFile()) throw new Error('不是文件');
-    if (stat.size > maxBytes) {
-      return { path: abs, size: stat.size, truncated: true, content: fs.readFileSync(abs).subarray(0, maxBytes).toString('utf8') };
-    }
-    return { path: abs, size: stat.size, truncated: false, content: fs.readFileSync(abs, 'utf8') };
+
+    const buf = fs.readFileSync(abs);
+    const truncated = buf.length > maxBytes;
+    const slice = truncated ? buf.subarray(0, maxBytes) : buf;
+
+    return {
+      path: abs,
+      size: stat.size,
+      truncated,
+      encoding: base64 ? 'base64' : 'utf8',
+      content: base64 ? slice.toString('base64') : slice.toString('utf8'),
+    };
   },
 
   async write({ path: p, content = '', encoding = 'utf8' } = {}) {
