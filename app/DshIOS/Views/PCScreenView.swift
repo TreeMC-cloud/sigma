@@ -187,7 +187,7 @@ final class MJPEGReceiver: NSObject, URLSessionDataDelegate {
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         if let http = response as? HTTPURLResponse {
             let ct = http.value(forHTTPHeaderField: "Content-Type") ?? "(无)"
-            Diagnostics.shared.record("屏幕", "响应 \(http.statusCode) · \(ct)")
+            screenLog("响应 \(http.statusCode) · \(ct)")
             if http.statusCode == 401 { onError?("令牌不对"); completionHandler(.cancel); return }
             if http.statusCode != 200 { onError?("电脑返回 \(http.statusCode)"); completionHandler(.cancel); return }
             if let ct = http.value(forHTTPHeaderField: "Content-Type"),
@@ -199,19 +199,31 @@ final class MJPEGReceiver: NSObject, URLSessionDataDelegate {
         completionHandler(.allow)
     }
 
+    /// 写一行诊断日志。
+    ///
+    /// 不能调 `Diagnostics.shared.record`：那是 MainActor 隔离的，
+    /// 而 URLSession 的回调在后台线程，编译期会报
+    /// 「call to main actor-isolated instance method in a synchronous nonisolated context」。
+    /// 这里直接走 nonisolated 的 appendLine，线程安全且顺序正确。
+    private func screenLog(_ text: String) {
+        let url = EnginePaths.real(EnginePaths.shared + "/app.log")
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        Diagnostics.appendLine("[\(stamp)] 屏幕 · \(text)", to: url)
+    }
+
     private var dataBatches = 0
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         buffer.append(data)
         dataBatches += 1
         if dataBatches <= 5 {
-            Diagnostics.shared.record("屏幕", "第 \(dataBatches) 批 \(data.count) 字节，缓冲 \(buffer.count)")
+            screenLog("第 \(dataBatches) 批 \(data.count) 字节，缓冲 \(buffer.count)")
         }
         extractFrames()
         if dataBatches == 1, buffer.count > 0 {
             // 第一批的首字节很关键：能看出服务端到底发了什么格式
             let head = buffer.prefix(40).map { String(format: "%02x", $0) }.joined()
-            Diagnostics.shared.record("屏幕", "首字节 \(head)")
+            screenLog("首字节 \(head)")
         }
     }
 
@@ -220,7 +232,7 @@ final class MJPEGReceiver: NSObject, URLSessionDataDelegate {
         if let error {
             let ns = error as NSError
             if ns.code == NSURLErrorCancelled { return }
-            Diagnostics.shared.record("屏幕", "失败 \(ns.code) · \(ns.localizedDescription)")
+            screenLog("失败 \(ns.code) · \(ns.localizedDescription)")
             onError?("连接中断（\(ns.code)）")
         } else {
             onError?("电脑断开了连接")
