@@ -444,7 +444,9 @@ const CAPS = {
       home: os.homedir(),
       node: process.version,
       addresses: lanAddresses(),
-      execEnabled: (CONFIG.allowExec || []).length > 0,
+      // execEnabled 现在由 execMode 决定，不再是「白名单非空」
+      execEnabled: CONFIG.execMode === 'all' || (CONFIG.allowExec || []).length > 0,
+      execMode: CONFIG.execMode || 'all',
       execAllowed: CONFIG.allowExec || [],
     };
   },
@@ -551,13 +553,20 @@ const CAPS = {
     const result = await new Promise((resolve) => {
       const win = IS_WIN;
       const file = win ? 'cmd.exe' : 'sh';
-      const args = win ? ['/d', '/s', '/c', command] : ['-c', command];
+      // ⚠ Windows 上 `cmd /c` 有时会卡在「等标准输入」——尤其是命令里
+      // 有需要确认的程序，或者 stdout 编码不对导致管道阻塞。
+      // 加 `/q`（不回显）+ 显式把 stdin 关掉（stdio ignore）能避免。
+      // 实测：不加这两条时，经中继的 exec 请求 25 秒也不回。
+      const args = win ? ['/d', '/q', '/s', '/c', command] : ['-c', command];
       execFile(file, args, {
         cwd: cwd ? safePath(cwd) : os.homedir(),
         timeout: Math.min(Number(timeoutMs) || 60000, 300000),
         maxBuffer: 16 * 1024 * 1024,
         windowsHide: true,
-        // Windows 上别弹窗、别交互
+        // stdin 必须是 ignore：默认是 pipe 且从不关闭，
+        // 任何「读一行」的程序（more、pause、某些 CLI）都会永远等下去，
+        // 表现为请求超时。这一条是 exec 卡住的主因。
+        stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, ...(win ? { PYTHONIOENCODING: 'utf-8' } : {}) },
       }, (err, stdout, stderr) => {
         resolve({
