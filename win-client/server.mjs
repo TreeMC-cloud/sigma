@@ -375,6 +375,77 @@ const PLACEHOLDER_JPEG = Buffer.from(
   + 'HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAA'
   + 'AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==', 'base64');
 
+// ── 双锁 ──────────────────────────────────────────────────────────────
+//
+// 借鉴 computer-use-for-all-agents 的做法：不用一把全局锁。
+// 一次屏幕采集要几百毫秒到几秒，如果和鼠标点击共用一把锁，
+// 用户点一下要等截图跑完——手感极差。
+//   输入锁：鼠标、键盘（短操作，必须快）
+//   读取锁：截图、目录列举（慢，但不该挡住输入）
+class Mutex {
+  constructor() { this.q = Promise.resolve(); }
+  run(fn) {
+    const next = this.q.then(fn, fn);
+    // 无论成败都推进队列，避免一次失败把后续全堵死
+    this.q = next.then(() => {}, () => {});
+    return next;
+  }
+}
+const inputLock = new Mutex();
+const readLock = new Mutex();
+
+// ── 卡键看门狗 ────────────────────────────────────────────────────────
+//
+// 为什么必须有：input 支持 keydown/click-down 这类「按下不松」的操作。
+// 如果 agent 按下 Ctrl 之后崩了、或者网络断了，Ctrl 会**一直被按住**，
+// 用户整台电脑的键盘就废了——点击变成多选、打字变成快捷键。
+//
+// 这是唯一会造成「用户电脑不可用」的缺陷，所以服务端强制兜底：
+//   · 记录每个被按下的键/按钮
+//   · 30 秒内没有任何新输入 → 全部释放
+//   · 提供 /release_all 让用户手动解卡
+const heldInputs = new Map();   // key -> 按下时间
+const WATCHDOG_MS = 30_000;
+
+function noteHeld(key) { heldInputs.set(key, Date.now()); }
+function clearHeld(key) { heldInputs.delete(key); }
+
+let watchdogBusy = false;
+const watchdog = setInterval(async () => {
+  if (watchdogBusy || heldInputs.size === 0) return;
+  const now = Date.now();
+  let stale = false;
+  for (const [, at] of heldInputs) {
+    if (now - at > WATCHDOG_MS) { stale = true; break; }
+  }
+  if (!stale) return;
+  watchdogBusy = true;
+  try {
+    await runInputScript('release_all');
+    heldInputs.clear();
+    audit({ kind: 'watchdog', action: 'release_all', reason: '30 秒无输入' });
+    console.log('  看门狗  已释放所有卡住的按键');
+  } catch { /* 下次再试 */ }
+  watchdogBusy = false;
+}, 5000);
+if (typeof watchdog.unref === 'function') watchdog.unref();
+
+/** 直接跑 input.ps1 的某个动作（给看门狗和 /release_all 用）。 */
+function runInputScript(action) {
+  const ps = IS_WIN ? 'powershell.exe' : 'pwsh';
+  const script = resolveEmbedded('input.ps1', EMBEDDED_INPUT_PS1);
+  return new Promise((resolve, reject) => {
+    execFile(ps, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+      '-Action', action, '-X', '0', '-Y', '0', '-Button', 'left',
+      '-Text', '', '-Keys', '', '-Delta', '0', '-MoveMs', '0'],
+      { timeout: 15000, windowsHide: true }, (err, stdout) => {
+        if (err) return reject(err);
+        try { resolve(JSON.parse(String(stdout).trim().split('\n').pop())); }
+        catch { resolve({ ok: true }); }
+      });
+  });
+}
+
 let screenProc = null;
 let screenInfo = null;      // { w, h, fps }
 let screenClients = new Set();
@@ -456,6 +527,50 @@ function stopScreenIfIdle() {
   }
 }
 
+/**
+ * 输入控制的真正实现。
+ *
+ * 为什么不在 CAPS 对象里写成 this._input：CAPS 是对象字面量，
+ * 解构 `const { input } = CAPS` 或经代理调用后 `this` 会丢，
+ * 报 `Cannot read properties of undefined (reading '_input')`。
+ * 提成模块级函数最稳。
+ */
+async function doInput({ action, x = 0, y = 0, button = 'left', text = '', keys = '', delta = 0, moveMs = 0 } = {}) {
+    const ALLOWED = ['move', 'click', 'dblclick', 'down', 'up', 'scroll', 'type', 'key', 'keydown', 'keyup', 'release_all', 'screen', 'pos'];
+    if (!ALLOWED.includes(action)) throw new Error(`不支持的动作：${action}`);
+
+    const ps = IS_WIN ? 'powershell.exe' : 'pwsh';
+    const script = resolveEmbedded('input.ps1', EMBEDDED_INPUT_PS1);
+    const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+      '-Action', action,
+      '-X', String(Math.round(Number(x) || 0)),
+      '-Y', String(Math.round(Number(y) || 0)),
+      '-Button', String(button),
+      '-Text', String(text),
+      '-Keys', String(keys),
+      '-Delta', String(Math.round(Number(delta) || 0)),
+      '-MoveMs', String(Math.round(Number(moveMs) || 0))];
+
+    // 记录「按下不松」的状态，交给看门狗兜底
+    if (action === 'down') noteHeld('mouse:left');
+    if (action === 'keydown') noteHeld('key:' + String(keys).toLowerCase());
+    if (action === 'keyup') clearHeld('key:' + String(keys).toLowerCase());
+    if (action === 'release_all') heldInputs.clear();
+
+    auditInput(action, { x, y, button, text, keys, delta });
+
+    return await new Promise((resolve, reject) => {
+      execFile(ps, args, { timeout: 15000, maxBuffer: 1024 * 1024, windowsHide: true },
+        (err, stdout) => {
+          const text = String(stdout || '').trim();
+          // 脚本总是输出一行 JSON；解析失败就说明 PowerShell 本身出错了
+          try { resolve(JSON.parse(text.split('\n').pop())); }
+          catch { reject(new Error(text || String(err?.message || '输入控制失败'))); }
+        });
+    });
+
+}
+
 // ── 能力 ──────────────────────────────────────────────────────────────
 const CAPS = {
   async info() {
@@ -478,7 +593,7 @@ const CAPS = {
     };
   },
 
-  async list({ path: p = '.' } = {}) {
+  async list({ path: p = '.' } = {}) { return readLock.run(async () => {
     const abs = safePath(p);
     const items = fs.readdirSync(abs, { withFileTypes: true }).map((e) => {
       let size = 0;
@@ -488,7 +603,7 @@ const CAPS = {
     // 目录在前，再按名字排，便于人读。
     items.sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
     return { path: abs, count: items.length, items: items.slice(0, 500) };
-  },
+    }); },
 
   async read({ path: p, maxBytes = 256 * 1024 } = {}) {
     const abs = safePath(p);
@@ -522,34 +637,19 @@ const CAPS = {
    * 安全取舍：这个能力**不设白名单**（设了就没法用），所以它比 exec 更危险。
    * 防护靠三件事：令牌、局域网/中继二选一、以及每次调用都写审计日志。
    */
-  async input({ action, x = 0, y = 0, button = 'left', text = '', keys = '', delta = 0, moveMs = 0 } = {}) {
-    const ALLOWED = ['move', 'click', 'dblclick', 'down', 'up', 'scroll', 'type', 'key', 'screen', 'pos'];
-    if (!ALLOWED.includes(action)) throw new Error(`不支持的动作：${action}`);
-
-    const ps = IS_WIN ? 'powershell.exe' : 'pwsh';
-    const script = resolveEmbedded('input.ps1', EMBEDDED_INPUT_PS1);
-    const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
-      '-Action', action,
-      '-X', String(Math.round(Number(x) || 0)),
-      '-Y', String(Math.round(Number(y) || 0)),
-      '-Button', String(button),
-      '-Text', String(text),
-      '-Keys', String(keys),
-      '-Delta', String(Math.round(Number(delta) || 0)),
-      '-MoveMs', String(Math.round(Number(moveMs) || 0))];
-
-    auditInput(action, { x, y, button, text, keys, delta });
-
-    return await new Promise((resolve, reject) => {
-      execFile(ps, args, { timeout: 15000, maxBuffer: 1024 * 1024, windowsHide: true },
-        (err, stdout) => {
-          const text = String(stdout || '').trim();
-          // 脚本总是输出一行 JSON；解析失败就说明 PowerShell 本身出错了
-          try { resolve(JSON.parse(text.split('\n').pop())); }
-          catch { reject(new Error(text || String(err?.message || '输入控制失败'))); }
-        });
-    });
+  async input({ action, x = 0, y = 0, button = 'left', text = '', keys = '', delta = 0, moveMs = 0, expectHwnd = null } = {}) {
+    // 守卫：发送输入前确认前台窗口是预期的那一个。
+    // 不做的话，agent 算好坐标、用户切了窗口，点击就落到别处——
+    // 可能点进微信、点掉一个对话框。这个检查很便宜，但能挡掉最糟的情况。
+    if (expectHwnd && ['type', 'key', 'keydown', 'keyup', 'click', 'dblclick'].includes(action)) {
+      const fg = await runInputScript('foreground');
+      if (fg && fg.ok && String(fg.hwnd) !== String(expectHwnd)) {
+        throw new Error(`前台窗口不对（当前：${fg.title}）。目标已切走，拒绝输入。`);
+      }
+    }
+    return inputLock.run(() => doInput({ action, x, y, button, text, keys, delta, moveMs }));
   },
+
 
   /**
    * 跑命令。
@@ -706,7 +806,11 @@ const server = http.createServer(async (req, res) => {
       json(res, 200, { ok: true, data: {
         exec: true, execMode: CONFIG.execMode,
         powershell: true, batch: true,
-        input: ['move', 'click', 'dblclick', 'down', 'up', 'scroll', 'type', 'key'],
+        input: ['move', 'click', 'dblclick', 'down', 'up', 'scroll', 'type',
+                'key', 'keydown', 'keyup', 'release_all', 'foreground', 'focus'],
+        safety: ['watchdog_30s', 'release_all', 'expect_hwnd_guard'],
+        concurrency: 'dual-lock (input / read)',
+        dpiAware: IS_WIN,
         screen: ['stream', 'single'],
         files: ['list', 'read', 'write'],
       } });
