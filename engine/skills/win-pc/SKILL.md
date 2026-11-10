@@ -293,6 +293,39 @@ preview.mjs open 报告.pdf --go
 
 **别让用户自己去电脑上找文件。** 他人在手机上，看不到那台电脑的桌面。
 
+## 改远端脚本：别一次只补一小块
+
+真机日志里，为了给 Blender 脚本加「双 UV」，连续做了 5 次往返：
+
+```
+1. edit build_house2.py
+2. sed 查 UV 部分
+3. node -e 插入 uv_mapped（5 次）
+4. node -e 注入双 UV
+5. node -e 切换 bake uv
+```
+
+每一次都是「改本地 → 上传 → 执行 → 看结果」。**5 次往返还把脚本改得越来越乱。**
+
+**正确做法：一次把整段逻辑想清楚，整块替换。**
+
+```sh
+# 先看要改的那一段长什么样
+pc.mjs run "powershell -c '(Get-Content build_house2.py)[120..180]'"
+
+# 然后一次性写好完整的新版本，整文件推上去
+cat > /tmp/build_house2_v2.py <<'PYEOF'
+...（完整脚本）
+PYEOF
+pc.mjs push /tmp/build_house2_v2.py "D:/proj/build_house2.py"
+```
+
+**判断标准：如果你已经在同一个文件上改了 3 次，就该停下来重写整段，而不是继续打补丁。**
+
+打补丁的危险不在于慢，而在于**你不知道改完的脚本整体长什么样**。
+真机上「双 UV 已注入」之后还要再补一次「bake uv switched」——
+如果一开始就想清楚，这两步是一个逻辑单元。
+
 ## 复杂 PowerShell 写成文件，别硬塞进命令行
 
 真机日志里反复卡在这一类：
