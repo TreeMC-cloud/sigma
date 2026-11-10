@@ -571,7 +571,10 @@ ctx.effect(() => {
         //   - 中间明确写「已截断 + 原长度 + 怎么拿全量」，让模型知道可以重跑取局部。
         try {
           ctx.on('tools/post-execute', (exec, result) => {
-            const limit = 40000;
+            // 40000 太高了：真机跑了一整天，一次都没触发过。
+            // 而一次 `cat` 大文件、一次全目录 ls 就能吃掉几万 token，
+            // 它会被**每一轮**重新读。15000 是「够看清结论、又不会撑爆上下文」的平衡点。
+            const limit = 15000;
             const content = result?.content;
             if (!Array.isArray(content)) return { kind: 'accept' };
             let total = 0;
