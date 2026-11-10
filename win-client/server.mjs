@@ -57,6 +57,9 @@ const CONFIG_PATH = path.join(HERE, 'config.json');
 // exe 里一定拿得到。运行时写进临时目录再交给 PowerShell。
 const EMBEDDED_SCREEN_PS1 = "# Sigma \u5c4f\u5e55\u91c7\u96c6 \u2014\u2014 \u6301\u7eed\u8f93\u51fa JPEG \u5e27\u5230 stdout\n#\n# \u4e3a\u4ec0\u4e48\u7528 PowerShell \u800c\u4e0d\u662f Node \u76f4\u63a5\u622a\u56fe\uff1a\n#   Node \u6ca1\u6709\u5185\u7f6e\u7684\u5c4f\u5e55\u6355\u83b7\u80fd\u529b\uff0c\u8981\u505a\u5c31\u5f97\u7f16\u8bd1 node-addon \u6216\u8005\u4f9d\u8d56\u539f\u751f\u6a21\u5757\uff0c\n#   \u800c\u5ba2\u6237\u7aef\u7684\u8bbe\u8ba1\u524d\u63d0\u662f\u300c\u96f6\u4f9d\u8d56\u3001\u5355\u6587\u4ef6 exe\u300d\u3002PowerShell \u5728\u6240\u6709 Windows \u4e0a\n#   \u90fd\u81ea\u5e26\uff0c.NET \u7684 System.Drawing \u80fd\u76f4\u63a5\u6293\u5c4f\u3002\n#\n# \u4e3a\u4ec0\u4e48\u662f**\u5e38\u9a7b\u8fdb\u7a0b**\u800c\u4e0d\u662f\u6bcf\u6b21\u8c03\u7528\uff1a\n#   \u6bcf\u6b21\u8d77\u4e00\u4e2a PowerShell \u8fdb\u7a0b\u8981 200-400ms\uff0c\u6700\u591a 3 \u5e27/\u79d2\uff1b\n#   \u5e38\u9a7b\u5faa\u73af\u80fd\u8fbe\u5230 10-15 \u5e27/\u79d2\uff0c\u8fd9\u624d\u662f\u300c\u89c6\u9891\u300d\u800c\u4e0d\u662f\u300c\u5e7b\u706f\u7247\u300d\u3002\n#\n# \u8f93\u51fa\u534f\u8bae\uff1a\u6bcf\u5e27\u524d\u6253\u5370 `--FRAME <\u5b57\u8282\u6570>`\uff0c\u7136\u540e\u5199\u539f\u59cb JPEG \u5b57\u8282\u3002\n#   \u7528\u957f\u5ea6\u524d\u7f00\u800c\u4e0d\u662f\u5206\u9694\u7b26\uff1aJPEG \u6570\u636e\u91cc\u4ec0\u4e48\u5b57\u8282\u90fd\u53ef\u80fd\u6709\uff0c\n#   \u5206\u9694\u7b26\u4f1a\u88ab\u8bef\u5224\uff0c\u957f\u5ea6\u524d\u7f00\u4e0d\u4f1a\u3002\n\nparam(\n  [int]$Fps = 12,\n  [int]$Quality = 55,\n  [double]$Scale = 0.5   # \u7f29\u5c0f\u4e00\u534a\uff1a1080p\u2192960x540\uff0c\u6d41\u91cf\u964d\u5230 1/4\uff0c\u8089\u773c\u770b\u76d1\u63a7\u591f\u7528\n)\n\n$ErrorActionPreference = 'Stop'\nAdd-Type -AssemblyName System.Drawing, System.Windows.Forms\n\n$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen\n$srcW = $bounds.Width\n$srcH = $bounds.Height\n$dstW = [int]($srcW * $Scale)\n$dstH = [int]($srcH * $Scale)\n\n$bmp = New-Object System.Drawing.Bitmap($srcW, $srcH)\n$gfx = [System.Drawing.Graphics]::FromImage($bmp)\n$small = New-Object System.Drawing.Bitmap($dstW, $dstH)\n$smallGfx = [System.Drawing.Graphics]::FromImage($small)\n$smallGfx.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::Bilinear\n\n$codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |\n  Where-Object { $_.MimeType -eq 'image/jpeg' }\n$ep = New-Object System.Drawing.Imaging.EncoderParameters(1)\n$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter(\n  [System.Drawing.Imaging.Encoder]::Quality, [long]$Quality)\n\n# \u544a\u8bc9\u7236\u8fdb\u7a0b\u300c\u6211\u51c6\u5907\u597d\u4e86\u300d\uff0c\u9644\u4e0a\u771f\u5b9e\u5206\u8fa8\u7387\n[Console]::Out.WriteLine(\"--READY $dstW $dstH $Fps\")\n[Console]::Out.Flush()\n\n$stdout = [Console]::OpenStandardOutput()\n$interval = [int](1000 / [Math]::Max(1, $Fps))\n\nwhile ($true) {\n  $t0 = [Environment]::TickCount\n\n  try {\n    $gfx.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bmp.Size)\n    $smallGfx.DrawImage($bmp, 0, 0, $dstW, $dstH)\n\n    $ms = New-Object System.IO.MemoryStream\n    $small.Save($ms, $codec, $ep)\n    $bytes = $ms.ToArray()\n    $ms.Dispose()\n\n    $header = [Text.Encoding]::ASCII.GetBytes(\"--FRAME $($bytes.Length)`n\")\n    $stdout.Write($header, 0, $header.Length)\n    $stdout.Write($bytes, 0, $bytes.Length)\n    $stdout.Flush()\n  } catch {\n    # \u9501\u5c4f\u3001UAC \u63d0\u6743\u754c\u9762\u3001\u5207\u6362\u7528\u6237\u65f6\u4f1a\u6293\u4e0d\u5230\u753b\u9762\u3002\n    # \u62a5\u544a\u4e00\u6b21\u9519\u8bef\u4f46\u7ee7\u7eed\u8dd1\uff1a\u7528\u6237\u89e3\u9501\u540e\u753b\u9762\u4f1a\u81ea\u52a8\u6062\u590d\u3002\n    $msg = [Text.Encoding]::ASCII.GetBytes(\"--ERROR $($_.Exception.Message)`n\")\n    $stdout.Write($msg, 0, $msg.Length)\n    $stdout.Flush()\n  }\n\n  # \u6309\u76ee\u6807\u5e27\u7387\u8865\u9f50\u95f4\u9694\uff0c\u907f\u514d\u6293\u591a\u5feb\u5c31\u53d1\u591a\u5feb\uff08\u90a3\u4f1a\u5360\u6ee1 CPU\uff09\n  $elapsed = [Environment]::TickCount - $t0\n  $sleep = $interval - $elapsed\n  if ($sleep -gt 0) { Start-Sleep -Milliseconds $sleep }\n}\n";
 
+// 输入控制脚本，同样内嵌：exe 里一定拿得到。
+const EMBEDDED_INPUT_PS1 = "# Sigma \u8f93\u5165\u63a7\u5236 \u2014\u2014 \u9f20\u6807\u4e0e\u952e\u76d8\n#\n# \u4e3a\u4ec0\u4e48\u7528 PowerShell \u800c\u4e0d\u662f Node \u539f\u751f\u6a21\u5757\uff1a\n#   \u5ba2\u6237\u7aef\u7684\u8bbe\u8ba1\u524d\u63d0\u662f\u300c\u96f6\u4f9d\u8d56\u3001\u5355\u6587\u4ef6 exe\u300d\u3002SendInput/SetCursorPos \u662f\n#   user32.dll \u91cc\u7684 C \u63a5\u53e3\uff0cNode \u8c03\u4e0d\u5230\uff1bPowerShell \u7528 Add-Type \u7f16\u8bd1\u4e00\u5c0f\u6bb5\n#   P/Invoke \u58f0\u660e\u5c31\u80fd\u8c03\uff0c\u800c\u4e14\u6240\u6709 Windows \u90fd\u81ea\u5e26 PowerShell\u3002\n#\n# \u4e3a\u4ec0\u4e48\u6bcf\u6b21\u8c03\u7528\u8d77\u4e00\u4e2a\u8fdb\u7a0b\uff1a\n#   \u9f20\u6807\u70b9\u51fb\u662f\u4f4e\u9891\u4e8b\u4ef6\uff08\u4eba\u624b\u64cd\u4f5c\uff09\uff0c\u4e0d\u50cf\u5c4f\u5e55\u91c7\u96c6\u8981\u8fde\u7eed\u8dd1\u3002\n#   \u8d77\u8fdb\u7a0b\u7ea6 200-400ms\uff0c\u5bf9\u4eba\u673a\u4ea4\u4e92\u5b8c\u5168\u591f\u7528\uff1b\u5e38\u9a7b\u8fdb\u7a0b\u53cd\u800c\u8981\u7ef4\u62a4 IPC \u534f\u8bae\u3002\n#\n# \u7528\u6cd5\uff08\u53c2\u6570\u5f62\u5f0f\uff09\uff1a\n#   powershell -File input.ps1 -Action move -X 100 -Y 200\n#   powershell -File input.ps1 -Action click -Button left\n#   powershell -File input.ps1 -Action type -Text \"\u4f60\u597d\"\n#   powershell -File input.ps1 -Action key -Keys \"CTRL+V\"\n#   powershell -File input.ps1 -Action scroll -Delta -3\n#   powershell -File input.ps1 -Action screen      # \u8fd4\u56de\u5c4f\u5e55\u5c3a\u5bf8\n\nparam(\n  [Parameter(Mandatory = $true)][string]$Action,\n  [int]$X = 0,\n  [int]$Y = 0,\n  [string]$Button = 'left',\n  [string]$Text = '',\n  [string]$Keys = '',\n  [int]$Delta = 0,\n  [int]$MoveMs = 0\n)\n\n$ErrorActionPreference = 'Stop'\n\nAdd-Type -AssemblyName System.Windows.Forms\n\nif (-not ('SigmaInput' -as [type])) {\n  Add-Type -TypeDefinition @'\nusing System;\nusing System.Runtime.InteropServices;\npublic class SigmaInput {\n  [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int x, int y);\n  [DllImport(\"user32.dll\")] public static extern bool GetCursorPos(out POINT p);\n  [DllImport(\"user32.dll\")] public static extern void mouse_event(uint f, int dx, int dy, int d, IntPtr e);\n  [DllImport(\"user32.dll\")] public static extern void keybd_event(byte k, byte s, uint f, IntPtr e);\n  [DllImport(\"user32.dll\")] public static extern short VkKeyScan(char ch);\n  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }\n\n  public const uint LEFTDOWN = 0x0002, LEFTUP = 0x0004;\n  public const uint RIGHTDOWN = 0x0008, RIGHTUP = 0x0010;\n  public const uint MIDDLEDOWN = 0x0020, MIDDLEUP = 0x0040;\n  public const uint WHEEL = 0x0800, HWHEEL = 0x1000;\n  public const uint KEYUP = 0x0002;\n}\n'@\n}\n\n$si = [SigmaInput]\n\nswitch ($Action) {\n\n  'screen' {\n    $b = [System.Windows.Forms.SystemInformation]::VirtualScreen\n    \"{`\"ok`\":true,`\"width`\":$($b.Width),`\"height`\":$($b.Height),`\"x`\":$($b.X),`\"y`\":$($b.Y)}\"\n  }\n\n  'pos' {\n    $p = New-Object SigmaInput+POINT\n    [void][SigmaInput]::GetCursorPos([ref]$p)\n    \"{`\"ok`\":true,`\"x`\":$($p.X),`\"y`\":$($p.Y)}\"\n  }\n\n  'move' {\n    # MoveMs > 0 \u65f6\u505a\u5e73\u6ed1\u79fb\u52a8\uff1a\u5f88\u591a\u7a0b\u5e8f\uff08\u6e38\u620f\u3001\u753b\u677f\uff09\u53ea\u8ba4\u8fde\u7eed\u79fb\u52a8\u4e8b\u4ef6\uff0c\n    # \u77ac\u79fb\u4f1a\u88ab\u5ffd\u7565\u6216\u5f53\u6210\u62d6\u62fd\u3002\n    if ($MoveMs -gt 0) {\n      $p = New-Object SigmaInput+POINT\n      [void][SigmaInput]::GetCursorPos([ref]$p)\n      $steps = [Math]::Max(6, [int]($MoveMs / 12))\n      for ($i = 1; $i -le $steps; $i++) {\n        $nx = [int]($p.X + ($X - $p.X) * $i / $steps)\n        $ny = [int]($p.Y + ($Y - $p.Y) * $i / $steps)\n        [void][SigmaInput]::SetCursorPos($nx, $ny)\n        Start-Sleep -Milliseconds ([Math]::Max(1, [int]($MoveMs / $steps)))\n      }\n    }\n    [void][SigmaInput]::SetCursorPos($X, $Y)\n    \"{`\"ok`\":true,`\"x`\":$X,`\"y`\":$Y}\"\n  }\n\n  'click' {\n    $down = $si::LEFTDOWN; $up = $si::LEFTUP\n    if ($Button -eq 'right')  { $down = $si::RIGHTDOWN;  $up = $si::RIGHTUP }\n    if ($Button -eq 'middle') { $down = $si::MIDDLEDOWN; $up = $si::MIDDLEUP }\n    [void][SigmaInput]::SetCursorPos($X, $Y)\n    Start-Sleep -Milliseconds 40\n    [SigmaInput]::mouse_event($down, 0, 0, 0, [IntPtr]::Zero)\n    Start-Sleep -Milliseconds 40\n    [SigmaInput]::mouse_event($up, 0, 0, 0, [IntPtr]::Zero)\n    \"{`\"ok`\":true,`\"button`\":`\"$Button`\",`\"x`\":$X,`\"y`\":$Y}\"\n  }\n\n  'dblclick' {\n    [void][SigmaInput]::SetCursorPos($X, $Y)\n    for ($i = 0; $i -lt 2; $i++) {\n      [SigmaInput]::mouse_event($si::LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)\n      [SigmaInput]::mouse_event($si::LEFTUP, 0, 0, 0, [IntPtr]::Zero)\n      Start-Sleep -Milliseconds 60\n    }\n    \"{`\"ok`\":true}\"\n  }\n\n  'down' {\n    [SigmaInput]::mouse_event($si::LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)\n    \"{`\"ok`\":true}\"\n  }\n\n  'up' {\n    [SigmaInput]::mouse_event($si::LEFTUP, 0, 0, 0, [IntPtr]::Zero)\n    \"{`\"ok`\":true}\"\n  }\n\n  'scroll' {\n    # Delta \u5355\u4f4d\u662f\u300c\u683c\u300d\uff0c\u6b63\u6570\u5411\u4e0a\u3002Windows \u7684 wheel \u53c2\u6570\u662f 120 \u7684\u500d\u6570\u3002\n    [SigmaInput]::mouse_event($si::WHEEL, 0, 0, ($Delta * 120), [IntPtr]::Zero)\n    \"{`\"ok`\":true,`\"delta`\":$Delta}\"\n  }\n\n  'type' {\n    # \u4e2d\u6587\u5fc5\u987b\u8d70 SendKeys \u7684\u526a\u8d34\u677f\u5916\u8def\u5f84 \u2014\u2014 \u76f4\u63a5\u7528 VkKeyScan \u53ea\u80fd\u6253\u82f1\u6587\u3002\n    # SendKeys \u652f\u6301\u4e00\u90e8\u5206 Unicode\uff0c\u4f46\u6162\uff1b\u5bf9\u4e2d\u6587\u66f4\u53ef\u9760\u7684\u662f\u5148\u5199\u526a\u8d34\u677f\u518d Ctrl+V\u3002\n    if ($Text -match '[^\\x00-\\x7F]') {\n      Set-Clipboard -Value $Text\n      Start-Sleep -Milliseconds 120\n      [System.Windows.Forms.SendKeys]::SendWait('^v')\n    } else {\n      [System.Windows.Forms.SendKeys]::SendWait($Text)\n    }\n    \"{`\"ok`\":true,`\"len`\":$($Text.Length)}\"\n  }\n\n  'key' {\n    # \u652f\u6301 \"CTRL+V\"\u3001\"ENTER\"\u3001\"ALT+TAB\" \u8fd9\u79cd\u7ec4\u5408\n    [System.Windows.Forms.SendKeys]::SendWait($Keys)\n    \"{`\"ok`\":true,`\"keys`\":`\"$Keys`\"}\"\n  }\n\n  default {\n    \"{`\"ok`\":false,`\"error`\":`\"\u672a\u77e5\u52a8\u4f5c: $Action`\"}\"\n    exit 1\n  }\n}\n";
+
 const PORT = Number(process.env.SIGMA_WIN_PORT || 8092);
 const BEACON_PORT = Number(process.env.SIGMA_WIN_BEACON || 8099);
 const IS_WIN = process.platform === 'win32';
@@ -155,6 +158,40 @@ function lanAddresses() {
     }
   }
   return out;
+}
+
+/**
+ * 取内嵌脚本的真实路径。
+ *
+ * pkg 打成 exe 后，内嵌资源在只读虚拟文件系统里，而 PowerShell 的 -File
+ * 需要一个真实路径——所以写到临时目录再用。文件名带 pid，避免多开冲突。
+ */
+function resolveEmbedded(name, content) {
+  const beside = path.join(HERE, name);
+  if (fs.existsSync(beside)) return beside;
+  const tmp = path.join(os.tmpdir(), `sigma-${process.pid}-${name}`);
+  if (!fs.existsSync(tmp)) fs.writeFileSync(tmp, content, 'utf8');
+  return tmp;
+}
+
+/**
+ * 输入操作的审计日志。
+ *
+ * 为什么要记：鼠标键盘是全权限操作，出了事（点错、误删）必须能回溯
+ * 「当时动了哪里」。只记时间和动作，不记打字内容（可能是密码）。
+ */
+function auditInput(action, args) {
+  try {
+    const line = JSON.stringify({
+      at: new Date().toISOString(),
+      action,
+      // 打字内容只记长度，绝不落盘明文
+      textLen: args.text ? String(args.text).length : 0,
+      keys: args.keys || undefined,
+      x: args.x, y: args.y, button: args.button, delta: args.delta,
+    }) + '\n';
+    fs.appendFileSync(path.join(HERE, 'input-audit.log'), line);
+  } catch { /* 审计失败不阻断操作 */ }
 }
 
 // ── 中继隧道（多路复用） ──────────────────────────────────────────────
@@ -307,18 +344,8 @@ function ensureScreen() {
   //   · exe 模式：pkg 把它作为 asset 打进了虚拟文件系统，从 __dirname 读
   //   · 源码模式：就在同目录
   // 之前只认磁盘文件，exe 里当然找不到 —— 一点「屏幕预览」就抛错。
-  const script = process.env.SIGMA_SCREEN_SCRIPT || path.join(HERE, 'screen.ps1');
-  let scriptPath = script;
-  if (!fs.existsSync(script)) {
-    // 退一步：把内置副本写到临时目录再用（PowerShell -File 需要真实路径）
-    const tmp = path.join(os.tmpdir(), `sigma-screen-${process.pid}.ps1`);
-    try {
-      fs.writeFileSync(tmp, EMBEDDED_SCREEN_PS1, 'utf8');
-      scriptPath = tmp;
-    } catch {
-      throw new Error('缺少 screen.ps1，且无法写入临时目录');
-    }
-  }
+  const scriptPath = process.env.SIGMA_SCREEN_SCRIPT
+    || resolveEmbedded('screen.ps1', EMBEDDED_SCREEN_PS1);
 
 
   // 参数顺序有讲究：
@@ -440,6 +467,44 @@ const CAPS = {
    * 为什么不做「任意命令」：这是客户自己的电脑，一旦令牌泄露，
    * 任意执行等于把整台机器交出去。白名单让人能明确知道放出去了什么。
    */
+  /**
+   * 鼠标键盘控制。
+   *
+   * 和 exec 的区别：exec 是「跑一个程序」，这是「操作当前桌面」——
+   * 移动光标、点击、打字。等同于用户亲手操作，对系统是全权限的。
+   *
+   * 安全取舍：这个能力**不设白名单**（设了就没法用），所以它比 exec 更危险。
+   * 防护靠三件事：令牌、局域网/中继二选一、以及每次调用都写审计日志。
+   */
+  async input({ action, x = 0, y = 0, button = 'left', text = '', keys = '', delta = 0, moveMs = 0 } = {}) {
+    const ALLOWED = ['move', 'click', 'dblclick', 'down', 'up', 'scroll', 'type', 'key', 'screen', 'pos'];
+    if (!ALLOWED.includes(action)) throw new Error(`不支持的动作：${action}`);
+
+    const ps = IS_WIN ? 'powershell.exe' : 'pwsh';
+    const script = resolveEmbedded('input.ps1', EMBEDDED_INPUT_PS1);
+    const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+      '-Action', action,
+      '-X', String(Math.round(Number(x) || 0)),
+      '-Y', String(Math.round(Number(y) || 0)),
+      '-Button', String(button),
+      '-Text', String(text),
+      '-Keys', String(keys),
+      '-Delta', String(Math.round(Number(delta) || 0)),
+      '-MoveMs', String(Math.round(Number(moveMs) || 0))];
+
+    auditInput(action, { x, y, button, text, keys, delta });
+
+    return await new Promise((resolve, reject) => {
+      execFile(ps, args, { timeout: 15000, maxBuffer: 1024 * 1024, windowsHide: true },
+        (err, stdout) => {
+          const text = String(stdout || '').trim();
+          // 脚本总是输出一行 JSON；解析失败就说明 PowerShell 本身出错了
+          try { resolve(JSON.parse(text.split('\n').pop())); }
+          catch { reject(new Error(text || String(err?.message || '输入控制失败'))); }
+        });
+    });
+  },
+
   async exec({ command, cwd, timeoutMs = 30000 } = {}) {
     if (!command || typeof command !== 'string') throw new Error('缺少 command');
     const allow = CONFIG.allowExec || [];
@@ -491,6 +556,13 @@ const server = http.createServer(async (req, res) => {
     if (!tokenOk(auth)) { json(res, 401, { ok: false, error: '令牌不对' }); return; }
 
     if (route === 'info') { json(res, 200, { ok: true, data: await CAPS.info() }); return; }
+
+    // 鼠标键盘：GET 也能调（方便浏览器里直接试），参数走查询串
+    if (route === 'input' && req.method === 'GET') {
+      const q = Object.fromEntries(url.searchParams.entries());
+      json(res, 200, { ok: true, data: await CAPS.input(q) });
+      return;
+    }
 
     // ── MJPEG 流 ──
     // 边界不用随机串：固定值即可，因为我们每帧都自带 Content-Length，
