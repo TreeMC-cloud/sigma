@@ -267,42 +267,58 @@ pc.mjs psfile /tmp/check.ps1
 返回空值、只有一个换行、或明显缺字段时，先怀疑「变量没传进去 / 路径不存在」，
 不要继续往下走——否则后面全建在错误前提上。
 
-## 每一步都要「看」一眼，不要盲等
+## 等待：用 wait，永远不要 sleep
 
-真机日志里反复出现这种：
+**这是最容易犯、也最浪费的错。** 真机日志里同样的下载，模型猜了
+`sleep 60` → `sleep 20` → `sleep 75` 三次，纯粹在赌时间。
 
-```sh
-sleep 60; pc.mjs ps "Get-Process *QQ*"    # 盲等一分钟，不知道中间发生了什么
-```
-
-**这是错的。** 你等 60 秒，可能第 3 秒就装好了，也可能第 3 秒就报错了——你都不知道。
-
-正确节奏是**动作 → 立刻看 → 再决定**：
+原因不是模型笨，是它**没有别的等待手段**。现在有了：
 
 ```sh
-# 1. 发起动作（不阻塞）
-pc.mjs ps "Start-Process 'C:\...\QQ.exe' -ArgumentList '/S'"
+# 等文件出现
+pc.mjs wait file_exists "C:\path\setup.exe"
 
-# 2. 立刻看一眼屏幕（不是等）
-pc.mjs shot                          # 返回 PNG 路径 + 尺寸 + 字节数
-pc.mjs ps "Get-Process *QQ* -ErrorAction SilentlyContinue | Select Name,Id"
+# 等下载完成（大小连续两次不变）
+pc.mjs wait file_stable "C:\path\big.7z"
 
-# 3. 没出来 → 再等 2-3 秒看一次；出来了 → 往下走
+# 等文件达到指定大小
+pc.mjs wait file_size "C:\path\x.iso" --min 700000000
+
+# 等进程退出（安装程序结束）
+pc.mjs wait process_gone msiexec
+
+# 等进程出现（软件启动了）
+pc.mjs wait process_alive QQ
+
+# 自定义条件（PowerShell 表达式，返回 $true 算满足）
+pc.mjs wait custom "(Get-Item 'C:\x' -EA SilentlyContinue).Length -gt 100MB"
 ```
 
-**「等一下」只有在「知道要等多久」时才用**。不知道就每 2-3 秒看一次，
-比你盲等 60 秒快得多，也安全得多。
+**一次调用会阻塞到条件成立，最多 110 秒。** 返回：
 
-### 截图的三种用法
+```
+✅ 已满足（等了 12.4 秒）· 349286912 bytes
+⚠️ 超时未满足（等了 110.0 秒）· 0 bytes     ← 该改方案了，不要再等
+```
 
-| 目的 | 怎么做 |
-|---|---|
-| **确认界面变了** | `pc.mjs shot` 拿到路径，看尺寸/字节数是否变化 |
-| **找按钮坐标** | 截图后用 `pc.mjs ps` 跑 UI Automation 读控件树，比看像素坐标可靠 |
-| **出错时取证** | 截图留下现场，比读日志更直观 |
+超时要**换方案**，不是接着 `sleep`。下载卡住就换镜像源；安装卡住就看日志找报错。
 
-**注意**：当前模型不支持图像输入，`shot` 只返回路径和尺寸——所以别指望「看图」，
-要靠 **UI Automation 读文字** 或 **进程/文件检查** 来验证。
+### 什么时候可以用 sleep
+
+**只在「知道确切要等多久」时**，且不超过 5 秒。比如某个 UI 动画需要 300ms。
+其余一律 `wait`。
+
+### 动作后立刻确认
+
+发起动作 → 立刻 `wait` 或查一次状态 → 按结果决定下一步。
+
+```sh
+pc.mjs ps "Start-Process 'C:\x\setup.exe' -ArgumentList '/S'"
+pc.mjs wait process_gone setup            # 等它装完
+pc.mjs ps "Get-ItemProperty HKLM:\...\Uninstall\* | ? DisplayName -like '*X*'"   # 确认装上了
+```
+
+**「退出码 0」不等于「装好了」**，最后那步确认不能省。
 
 ## 验证：做完要比对，不是发出去就算
 
