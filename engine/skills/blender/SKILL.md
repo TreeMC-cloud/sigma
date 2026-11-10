@@ -223,6 +223,123 @@ pc.mjs info | grep -E "name|hostname"
 
 交付说明里只写**实际生效的设置**，不要把「考虑过的方案」写进结果描述。
 
+## 「太卡通」怎么修：按影响排序
+
+真机日志里用户的原话：
+
+> 你说 blender 能不能做 想现实真实场景那样的 你这个太卡通
+
+模型回答「责任在我用的方法，不在 Blender」——这句是对的。但接下来
+只去做「下载 PBR 素材」一件事，不够。
+
+**卡通感有四个来源，按影响从大到小：**
+
+### 1. 材质：没有真实 PBR（影响最大）
+
+程序化材质（纯色 + 一点点粗糙度）是卡通感的第一来源。
+
+```python
+# 检查：有多少材质带真实贴图？
+def check_pbr():
+    plain = []
+    for m in bpy.data.materials:
+        if not m.use_nodes: continue
+        has_tex = any(n.type in ('TEX_IMAGE', 'TEX_ENVIRONMENT')
+                      for n in m.node_tree.nodes)
+        if not has_tex:
+            plain.append(m.name)
+    return plain      # 非空就是「一眼假」
+```
+
+**修法**：从 Poly Haven / ambientCG 拿 **CC0** 的 PBR 套装，
+每个材质至少要有：
+
+| 贴图 | 作用 | 缺了会怎样 |
+|---|---|---|
+| Base Color | 颜色 | 纯色 = 塑料 |
+| Roughness | 粗糙度 | 全场均匀反光 = 假 |
+| Normal | 表面起伏 | 完全平滑 = 假 |
+| **Ambient Occlusion** | 缝隙阴影 | 接缝处没暗角 = 浮 |
+
+**一张 base color 是不够的。** 只有颜色没有粗糙度和法线，还是塑料感。
+
+### 2. 光照：单一光源最假
+
+默认的「一个太阳 + 纯环境光」= 硬邦邦的卡通光照。
+
+真实场景的光照结构：
+
+```python
+# 三点光 + HDRI 环境
+bpy.ops.object.light_add(type='AREA', location=(3, -3, 4))   # key
+key = bpy.context.object
+key.data.energy = 500
+key.data.size = 2.0        # 面积光，不是点光——点光阴影太锐
+
+bpy.ops.object.light_add(type='AREA', location=(-4, -2, 2))  # fill
+bpy.context.object.data.energy = 150
+bpy.context.object.data.size = 3.0
+
+bpy.ops.object.light_add(type='AREA', location=(0, 4, 3))    # rim
+bpy.context.object.data.energy = 300
+
+# 环境光用 HDRI 而不是纯色
+world = bpy.context.scene.world
+world.use_nodes = True
+env = world.node_tree.nodes.new('ShaderNodeTexEnvironment')
+env.image = bpy.data.images.load('studio.hdr')
+```
+
+**关键：面积光（AREA）而不是点光（POINT）。** 点光的阴影边缘像刀切，
+面积光才有柔和的过渡——这是「真实感」的核心。
+
+### 3. 相机：套用摄影参数
+
+```python
+cam = bpy.context.scene.camera.data
+cam.lens = 35              # 不是默认 50，35-50 更像人眼
+cam.dof.use_dof = True     # 开启景深！
+cam.dof.aperture_fstop = 2.8
+cam.dof.focus_distance = 5.0
+```
+
+**景深是最便宜的「真实感」开关。** 卡通渲染通常全景清晰，
+而真实照片一定有虚化。
+
+### 4. 色彩管理：别用 Standard
+
+```python
+scene = bpy.context.scene
+scene.view_settings.view_transform = 'AgX'    # 4.x 默认，电影感
+# 或 'Filmic'（3.x）
+scene.view_settings.look = 'AgX - Medium High Contrast'
+```
+
+`Standard` 会让高光直接爆白、颜色过饱和——那就是「塑料感」的来源之一。
+
+### 渲染设置（GTX 1060 这类入门独显）
+
+```python
+sc.cycles.device = 'GPU'
+sc.cycles.samples = 64              # 有降噪的话 64 够，不必 512
+sc.cycles.use_denoising = True
+sc.cycles.denoiser = 'OPENIMAGEDENOISE'   # CPU 降噪，任何显卡都能用
+sc.render.resolution_x = 1600
+sc.render.resolution_y = 1000
+```
+
+**512 采样 + 无降噪 是最浪费的组合**：慢 8 倍，噪点还不一定少。
+**64 采样 + OIDN 降噪** 通常比 512 采样裸渲染更干净。
+
+### 交付前问自己四个问题
+
+1. 每个材质都有 base/rough/normal 三张图吗？
+2. 主光是不是面积光？有没有补光？
+3. 开了景深吗？
+4. 色彩管理是 AgX/Filmic 还是 Standard？
+
+**四个里缺两个以上，用户一定会说「太卡通」。**
+
 ## 渲染前先估算时间
 
 ```python
