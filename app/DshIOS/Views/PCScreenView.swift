@@ -12,6 +12,9 @@ import UIKit
 /// 关键约束：**只在可见时拉流**。手机和电脑都在局域网，一直推流会同时
 /// 烧两边电量；`onDisappear` 里必须 stop，否则退出页面后还在后台收数据。
 struct PCScreenView: View {
+    /// 用户是否还停在这一页（后台回来时据此决定要不要恢复轮询）
+    @State private var wantRunning = false
+
     let baseURL: String
     let token: String
 
@@ -53,15 +56,15 @@ struct PCScreenView: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
         )
-        .onAppear(perform: start)
-        .onDisappear(perform: stop)
+        .onAppear { wantRunning = true; start() }
+        .onDisappear { wantRunning = false; stop() }
         // App 切到后台时必须停：iOS 会冻结定时器，但 TCP 请求会挂在那里，
         // 回前台后一堆过期请求同时完成，画面会跳。
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.didEnterBackgroundNotification)) { _ in stop() }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.willEnterForegroundNotification)) { _ in
-            if !stopped { start() }
+            if wantRunning { start() }
         }
     }
 
