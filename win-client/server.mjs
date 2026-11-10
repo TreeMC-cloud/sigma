@@ -81,6 +81,11 @@ function loadConfig() {
     name: os.hostname(),
     // 允许执行的命令（可执行文件名，不含参数）。默认空 = 完全禁止。
     // 客户自己往里加。空着也能用文件读写，只是不能跑命令。
+    // 执行模式：
+    //   'all'       —— 能跑任何命令（默认）。这是用户明确要的「电脑能干活」。
+    //   'whitelist' —— 只跑 allowExec 里的程序。
+    // 无论哪种模式，每条命令都写审计日志。
+    execMode: 'all',
     allowExec: [],
     // 允许访问的根目录；默认是用户主目录。留空 = 不限制（不推荐）。
     roots: [os.homedir()],
@@ -180,18 +185,30 @@ function resolveEmbedded(name, content) {
  * 为什么要记：鼠标键盘是全权限操作，出了事（点错、误删）必须能回溯
  * 「当时动了哪里」。只记时间和动作，不记打字内容（可能是密码）。
  */
-function auditInput(action, args) {
+/**
+ * 统一审计：所有「对电脑产生副作用」的操作都从这里走。
+ *
+ * 只记结构化摘要，不记可能含密码的明文（打字内容只记长度）。
+ * 日志在 exe 同目录的 audit.log，一行一条 JSON，方便 grep/转发。
+ */
+function audit(entry) {
   try {
-    const line = JSON.stringify({
-      at: new Date().toISOString(),
-      action,
-      // 打字内容只记长度，绝不落盘明文
-      textLen: args.text ? String(args.text).length : 0,
-      keys: args.keys || undefined,
-      x: args.x, y: args.y, button: args.button, delta: args.delta,
-    }) + '\n';
-    fs.appendFileSync(path.join(HERE, 'input-audit.log'), line);
-  } catch { /* 审计失败不阻断操作 */ }
+    const line = JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n';
+    fs.appendFileSync(path.join(HERE, 'audit.log'), line);
+    auditRing.push(line);
+    if (auditRing.length > 500) auditRing.shift();
+  } catch { /* 审计失败不阻断 */ }
+}
+const auditRing = [];
+
+function auditInput(action, args) {
+  // 打字内容只记长度，绝不落盘明文——那里可能是密码
+  audit({
+    kind: 'input', action,
+    textLen: args.text ? String(args.text).length : 0,
+    keys: args.keys || undefined,
+    x: args.x, y: args.y, button: args.button, delta: args.delta,
+  });
 }
 
 // ── 中继隧道（多路复用） ──────────────────────────────────────────────
@@ -505,31 +522,114 @@ const CAPS = {
     });
   },
 
-  async exec({ command, cwd, timeoutMs = 30000 } = {}) {
+  /**
+   * 跑命令。
+   *
+   * 和旧版的区别：
+   *   · **走真正的 shell**（Windows 用 cmd /c，其他用 sh -c），所以管道、
+   *     重定向、`&&`、通配符全都能用。旧版用 execFile 直调，等于半个残废，
+   *     连 `dir | findstr xxx` 都跑不了。
+   *   · 默认 execMode='all'，不再因为白名单为空而拒绝一切。
+   *   · 每条都记审计（命令全文、退出码、耗时），出问题能回溯。
+   */
+  async exec({ command, cwd, timeoutMs = 60000 } = {}) {
     if (!command || typeof command !== 'string') throw new Error('缺少 command');
-    const allow = CONFIG.allowExec || [];
-    if (allow.length === 0) throw new Error('未启用命令执行：请在 config.json 的 allowExec 里加上允许的程序');
-    // 只看第一个词，不解析管道/重定向——不做 shell，避免注入。
-    const parts = command.trim().split(/\s+/);
-    const bin = parts[0].replace(/\.exe$/i, '');
-    if (!allow.map((x) => x.replace(/\.exe$/i, '')).includes(bin)) {
-      throw new Error(`命令不在白名单：${bin}（允许：${allow.join(', ')}）`);
+
+    // 白名单模式才检查；默认 'all' 直接放行
+    if (CONFIG.execMode === 'whitelist') {
+      const allow = (CONFIG.allowExec || []).map((x) => x.replace(/\.exe$/i, '').toLowerCase());
+      if (allow.length === 0) throw new Error('execMode 是 whitelist 但 allowExec 为空');
+      const bin = command.trim().split(/\s+/)[0].replace(/^"|"$/g, '').replace(/\.exe$/i, '').toLowerCase();
+      // 兼容 `C:\path\to\node.exe` 这种绝对路径
+      const base = bin.split(/[\\/]/).pop();
+      if (!allow.includes(bin) && !allow.includes(base)) {
+        throw new Error(`命令不在白名单：${base}（允许：${allow.join(', ')}）`);
+      }
     }
-    return await new Promise((resolve) => {
-      execFile(parts[0], parts.slice(1), {
-        cwd: cwd ? safePath(cwd) : undefined,
-        timeout: Math.min(Number(timeoutMs) || 30000, 120000),
-        maxBuffer: 4 * 1024 * 1024,
+
+    const started = Date.now();
+    const result = await new Promise((resolve) => {
+      const win = IS_WIN;
+      const file = win ? 'cmd.exe' : 'sh';
+      const args = win ? ['/d', '/s', '/c', command] : ['-c', command];
+      execFile(file, args, {
+        cwd: cwd ? safePath(cwd) : os.homedir(),
+        timeout: Math.min(Number(timeoutMs) || 60000, 300000),
+        maxBuffer: 16 * 1024 * 1024,
+        windowsHide: true,
+        // Windows 上别弹窗、别交互
+        env: { ...process.env, ...(win ? { PYTHONIOENCODING: 'utf-8' } : {}) },
+      }, (err, stdout, stderr) => {
+        resolve({
+          ok: !err,
+          code: typeof err?.code === 'number' ? err.code : (err ? 1 : 0),
+          stdout: String(stdout || '').slice(0, 400000),
+          stderr: String(stderr || '').slice(0, 40000),
+          ms: Date.now() - started,
+        });
+      });
+    });
+
+    audit({ kind: 'exec', command: command.slice(0, 500), ok: result.ok, code: result.code, ms: result.ms });
+    return result;
+  },
+
+  /**
+   * 直接跑 PowerShell 脚本。最灵活的一条路：WMI、注册表、COM、.NET 全能用。
+   *
+   * 为什么单独开这个而不让用户塞进 exec：exec 走 cmd，引号和转义容易打架；
+   * 这里用 -EncodedCommand（UTF-16LE base64），任何字符都不会被解释。
+   */
+  /**
+   * 批量跑命令。为「效率」而存在：
+   * 手机经中继访问，一次往返几百毫秒；要跑 10 条命令时逐条发很慢。
+   *
+   * @param commands [{ command, cwd?, stopOnError? }]
+   * 顺序执行（并行会让输出混杂，反而更难用）。
+   */
+  async batch({ commands = [], cwd = null } = {}) {
+    if (!Array.isArray(commands) || commands.length === 0) throw new Error('缺少 commands');
+    if (commands.length > 30) throw new Error('一次最多 30 条');
+    const results = [];
+    for (const item of commands) {
+      const cmd = typeof item === 'string' ? item : item?.command;
+      if (!cmd) { results.push({ command: '', ok: false, error: '空命令' }); continue; }
+      try {
+        const r = await CAPS.exec({ command: cmd, cwd: item?.cwd ?? cwd, timeoutMs: item?.timeoutMs });
+        results.push({ command: cmd, ...r });
+        if (!r.ok && item?.stopOnError) break;
+      } catch (e) {
+        results.push({ command: cmd, ok: false, error: String(e?.message || e) });
+        if (item?.stopOnError) break;
+      }
+    }
+    return { ok: results.every((r) => r.ok), count: results.length, results };
+  },
+
+  async ps({ script, timeoutMs = 120000 } = {}) {
+    if (!script || typeof script !== 'string') throw new Error('缺少 script');
+    const ps = IS_WIN ? 'powershell.exe' : 'pwsh';
+    // -EncodedCommand 避免所有引号/换行问题
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    const started = Date.now();
+    const result = await new Promise((resolve) => {
+      execFile(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-EncodedCommand', encoded], {
+        timeout: Math.min(Number(timeoutMs) || 120000, 300000),
+        maxBuffer: 16 * 1024 * 1024,
         windowsHide: true,
       }, (err, stdout, stderr) => {
         resolve({
           ok: !err,
-          code: err?.code ?? 0,
-          stdout: String(stdout || '').slice(0, 200000),
-          stderr: String(stderr || '').slice(0, 20000),
+          code: typeof err?.code === 'number' ? err.code : (err ? 1 : 0),
+          stdout: String(stdout || '').slice(0, 400000),
+          stderr: String(stderr || '').slice(0, 40000),
+          ms: Date.now() - started,
         });
       });
     });
+    audit({ kind: 'ps', command: script.slice(0, 300), ok: result.ok, code: result.code, ms: result.ms });
+    return result;
   },
 };
 
@@ -556,6 +656,26 @@ const server = http.createServer(async (req, res) => {
     if (!tokenOk(auth)) { json(res, 401, { ok: false, error: '令牌不对' }); return; }
 
     if (route === 'info') { json(res, 200, { ok: true, data: await CAPS.info() }); return; }
+
+    // 审计日志：手机端可直接看「刚才电脑上做了什么」
+    if (route === 'audit') {
+      const n = Math.min(Number(url.searchParams.get('n')) || 50, 500);
+      const lines = auditRing.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return l; } });
+      json(res, 200, { ok: true, data: { count: lines.length, entries: lines } });
+      return;
+    }
+
+    // 能力清单：让 agent 知道这台电脑能做什么
+    if (route === 'caps') {
+      json(res, 200, { ok: true, data: {
+        exec: true, execMode: CONFIG.execMode,
+        powershell: true, batch: true,
+        input: ['move', 'click', 'dblclick', 'down', 'up', 'scroll', 'type', 'key'],
+        screen: ['stream', 'single'],
+        files: ['list', 'read', 'write'],
+      } });
+      return;
+    }
 
     // 鼠标键盘：GET 也能调（方便浏览器里直接试），参数走查询串
     if (route === 'input' && req.method === 'GET') {
