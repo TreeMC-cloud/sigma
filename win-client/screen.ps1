@@ -46,6 +46,26 @@ catch { try { [void][SigmaDpi]::SetProcessDPIAware() } catch { } }
 $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
 $srcW = $bounds.Width
 $srcH = $bounds.Height
+
+# ⚠ 兜底：从显卡驱动直接读物理分辨率。
+#
+# 真机实测（2560x1288 的屏、200% 缩放）：
+#   即使调了 SetProcessDpiAwarenessContext(-4)，
+#   SystemInformation.VirtualScreen 仍然只报 1280x644 —— 正好一半。
+# 结果 CopyFromScreen 只抓到屏幕左上角 1/4 的面积。
+#
+# Win32_VideoController 的 CurrentHorizontalResolution 是驱动层的真实值，
+# 不受进程 DPI 影响。两个值不一致就以它为准。
+try {
+  $vc = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+        Where-Object { $_.CurrentHorizontalResolution -gt 0 } | Select-Object -First 1
+  if ($vc -and $vc.CurrentHorizontalResolution -gt $srcW) {
+    $srcW = [int]$vc.CurrentHorizontalResolution
+    $srcH = [int]$vc.CurrentVerticalResolution
+    # 边界也要跟着改：VirtualScreen 的 X/Y 在缩放环境下通常是 0
+    $bounds = New-Object System.Drawing.Rectangle(0, 0, $srcW, $srcH)
+  }
+} catch { /* 查询失败就用 VirtualScreen 的值 */ }
 $dstW = [int]($srcW * $Scale)
 $dstH = [int]($srcH * $Scale)
 
