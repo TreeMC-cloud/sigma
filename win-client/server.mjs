@@ -157,29 +157,60 @@ function lanAddresses() {
   return out;
 }
 
-// ── 中继隧道 ──────────────────────────────────────────────────────────
+// ── 中继隧道（多路复用） ──────────────────────────────────────────────
 //
-// 目的：电脑没有公网 IP 时，手机在外网也能连。
+// 每个 HTTP 请求一个 rid，各自开一条到本机 HTTP 的 TCP。
+// 为什么不用一条共享连接：App 会同时发 /health 和 /screen（MJPEG 永不结束），
+// 共享连接时两个响应会互相踩，表现是「连上了但立刻中断」。
 //
-// 做法：主动出站连到中继（WebSocket），手机也连同一个中继，
-// 中继按配对码把两条连接对接。出站连接能穿任何 NAT，所以两边都不需要
-// 公网地址。
-//
-// 关键设计：进来的字节被当成**原始 TCP 流**喂给本机的 HTTP 服务。
-// 不解码、不重组——中继只做管道，这样分块传输、大文件、MJPEG 流
-// 全都能原样穿过，不需要为每种情况写特殊处理。
+// 协议（与中继一致）：
+//   收到 {"type":"req","rid":N} → 准备好接下一帧二进制（HTTP 请求）
+//   收到二进制              → 写进该 rid 的 TCP
+//   TCP 有数据回来          → {"type":"res","rid":N} + 二进制帧
+//   TCP 关闭                → {"type":"end","rid":N}
 
 let relayWS = null;
-let relayState = 'off';   // off | connecting | online | error
+let relayState = 'off';
 let relayError = null;
+const tunnels = new Map();   // rid -> { sock }
+let pendingRid = null;
+
+function sendText(obj) {
+  if (relayWS && relayWS.readyState === 1) relayWS.send(JSON.stringify(obj));
+}
+function sendBinary(buf) {
+  if (relayWS && relayWS.readyState === 1) {
+    relayWS.send(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+  }
+}
+
+function openTunnelFor(rid) {
+  const sock = net.connect(PORT, '127.0.0.1');
+  sock.setNoDelay(true);
+  tunnels.set(rid, { sock });
+  sock.on('data', (d) => {
+    sendText({ type: 'res', rid });
+    sendBinary(d);
+  });
+  const close = () => {
+    if (tunnels.delete(rid)) sendText({ type: 'end', rid });
+  };
+  sock.on('close', close);
+  sock.on('error', close);
+  return sock;
+}
+
+function closeAllTunnels() {
+  for (const [, t] of tunnels) { try { t.sock.destroy(); } catch { /* 已断 */ } }
+  tunnels.clear();
+}
 
 function connectRelay() {
   const url = CONFIG.relay;
   if (!url || relayState === 'connecting' || relayState === 'online') return;
   if (typeof WebSocket === 'undefined') {
     relayState = 'error';
-    relayError = '这个 Node 版本没有内置 WebSocket（需要 21+）';
-    console.log(`  中继    不可用：${relayError}`);
+    console.log('  中继    不可用：这个 Node 版本没有内置 WebSocket');
     return;
   }
 
@@ -194,109 +225,56 @@ function connectRelay() {
   });
 
   ws.addEventListener('message', (evt) => {
-    // ⚠ 关键：手机可能把 HTTP 请求当**文本帧**发过来（WebSocket 的 send(string)），
-    // 也可能当二进制帧。握手完成后所有文本都要当数据，不能只认二进制——
-    // 之前只处理二进制，文本帧进了 JSON.parse 失败就被静默丢掉，
-    // 表现是「配对了但一个字节都过不来」。
-    if (relayState === 'online' && typeof evt.data === 'string' && !evt.data.startsWith('{')) {
-      handleTunnelChunk(Buffer.from(evt.data, 'utf8'));
-      return;
-    }
     if (typeof evt.data === 'string') {
       try {
         const msg = JSON.parse(evt.data);
         if (msg.type === 'registered') {
           relayState = 'online';
           console.log(`  中继    已上线（配对码 ${CONFIG.code}）`);
+        } else if (msg.type === 'req') {
+          pendingRid = msg.rid;
+        } else if (msg.type === 'reset') {
+          closeAllTunnels();
         }
-        if (msg.type === 'paired') {
-          console.log('\n  ✓ 手机已通过中继连上\n');
-          closeTunnel();
-          openTunnel();
-        }
-        if (msg.type === 'error') { relayState = 'error'; relayError = msg.message; }
-      } catch { /* 非 JSON 文本：当数据丢弃 */ }
+      } catch { /* 非 JSON：丢弃 */ }
       return;
     }
-    handleTunnelChunk(Buffer.from(evt.data));
+    // 二进制：如果刚收到 req，说明这是新的 HTTP 请求
+    const buf = Buffer.from(evt.data);
+    if (pendingRid !== null) {
+      const sock = openTunnelFor(pendingRid);
+      pendingRid = null;
+      try { sock.write(buf); } catch { /* 写失败，close 兜 */ }
+      return;
+    }
+    // 否则是某个 rid 的后续数据（少见：请求体分片）
+    const last = [...tunnels.keys()].pop();
+    if (last !== undefined) {
+      const t = tunnels.get(last);
+      if (t) { try { t.sock.write(buf); } catch { /* 已断 */ } }
+    }
   });
 
-  // 重连：**只要不是主动关的，就一直重连**。
-  //
-  // 原来的条件只在 online/connecting 时重连，而 relayState 会被
-  // 'error' 事件先改成 'error' —— 于是「启动时中继正好重启」这种情况下
-  // 客户端永远不再尝试，界面上看是「已安装但连不上」，而且没提示。
   let closedByUs = false;
   const scheduleRetry = () => {
     if (closedByUs) return;
     relayWS = null;
-    closeTunnel();
+    closeAllTunnels();
     relayState = 'off';
     setTimeout(() => { if (!relayWS) connectRelay(); }, 5000);
   };
-
   ws.addEventListener('close', scheduleRetry);
   ws.addEventListener('error', (e) => {
     relayState = 'error';
-    relayError = (e && e.message) || '连不上中继（网络被拦？）';
+    relayError = (e && e.message) || '连不上中继';
     console.log(`  中继    连接失败：${relayError}（5 秒后重试）`);
   });
-  // 主动断开（进程退出）时不重连
   process.on('exit', () => { closedByUs = true; });
 
   relayWS = ws;
 }
 
-/**
- * 隧道 → 本机 HTTP 的一条长连接。
- *
- * 之前每个数据块都新建一条 TCP，把块当成「完整请求」——错在两点：
- *   1. 一个 HTTP 请求可能被拆成多个 WebSocket 消息
- *   2. 一次 TCP 只能处理一个请求，客户端复用连接就废了
- *
- * 现在：配对成功后开一条 TCP，双向对接，来多少转多少。
- * 不解析 HTTP，所以分块、长连接、MJPEG 流全都自然可用。
- */
-let tunnelSock = null;
-
-function openTunnel() {
-  if (tunnelSock) return tunnelSock;
-  tunnelSock = net.connect(PORT, '127.0.0.1');
-  tunnelSock.setNoDelay(true);
-  // 手机那头断了就关掉这条，下次配对重开
-  tunnelSock.on('close', () => { tunnelSock = null; });
-  tunnelSock.on('error', () => { tunnelSock = null; });
-  tunnelSock.on('data', (d) => {
-    if (process.env.SIGMA_TUNNEL_DEBUG) console.log(`  隧道    → ${d.length} 字节回传`);
-    if (relayWS && relayWS.readyState === 1) {
-      // 转成 ArrayBuffer 发：中继按二进制原样转发
-      relayWS.send(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
-    }
-  });
-  return tunnelSock;
-}
-
-function closeTunnel() {
-  if (tunnelSock) { try { tunnelSock.destroy(); } catch { /* 已断 */ } tunnelSock = null; }
-}
-
-function handleTunnelChunk(buf) {
-  const sock = openTunnel();
-  if (!sock) { console.log('  隧道    没有连接，丢弃', buf.length, '字节'); return; }
-  if (process.env.SIGMA_TUNNEL_DEBUG) {
-    console.log(`  隧道    ← ${buf.length} 字节：${buf.subarray(0, 60).toString('utf8').replace(/\r\n/g, ' ')}`);
-  }
-  // 可能还没连上（connect 是异步的），排队等 ready
-  if (sock.connecting) {
-    sock.once('connect', () => { try { sock.write(buf); } catch { /* 已断 */ } });
-  } else {
-    try { sock.write(buf); } catch { /* 写失败，close 会兜 */ }
-  }
-}
-
-function renderBanner() {
-  // 由主流程统一打印，这里只更新状态
-}
+function renderBanner() {}
 
 // ── 屏幕流（MJPEG） ───────────────────────────────────────────────────
 //
