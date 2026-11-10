@@ -767,6 +767,51 @@ const CAPS = {
     return { ok: results.every((r) => r.ok), count: results.length, results };
   },
 
+  /**
+   * 下载文件到磁盘。给「装软件」这类任务用。
+   *
+   * 为什么不直接用 exec 调 curl/Invoke-WebRequest：
+   *   大文件会让整个 HTTP 请求等很久，容易撞上中继超时。
+   *   这里改成**后台下载 + 立即返回**，agent 可以过一会儿查进度。
+   *
+   * @param url      下载地址
+   * @param path     存到哪（默认 Downloads 下按 URL 猜文件名）
+   */
+  async download({ url, path = null, timeoutMs = 600000 } = {}) {
+    if (!url || typeof url !== 'string') throw new Error('缺少 url');
+    const name = path || path.join(os.homedir(), 'Downloads',
+      (url.split('/').pop() || 'download.bin').split('?')[0]);
+    const dest = safePath(name);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+
+    const started = Date.now();
+    if (IS_WIN) {
+      // Start-BitsTransfer 断点续传、后台、系统级，比 Invoke-WebRequest 稳
+      const ps = `$ProgressPreference='SilentlyContinue';` +
+        `Start-BitsTransfer -Source '${url.replace(/'/g, "''")}' -Destination '${dest.replace(/'/g, "''")}'`;
+      const r = await new Promise((resolve) => {
+        execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+          '-OutputFormat', 'Text', '-EncodedCommand',
+          Buffer.from(ps, 'utf16le').toString('base64')],
+          { timeout: Math.min(timeoutMs, 900000), windowsHide: true, maxBuffer: 1024 * 1024 },
+          (err, stdout, stderr) => resolve({ ok: !err, err: err?.message, stderr: String(stderr || '') }));
+      });
+      const size = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+      audit({ kind: 'download', url: url.slice(0, 200), path: dest, size, ok: r.ok });
+      if (!r.ok) throw new Error(`下载失败：${r.err || r.stderr || '未知'}`);
+      return { ok: true, path: dest, bytes: size, ms: Date.now() - started };
+    }
+
+    // 非 Windows（测试/其他平台）：用 PowerShell 或 curl
+    return await new Promise((resolve, reject) => {
+      execFile('curl', ['-sSL', '-o', dest, url],
+        { timeout: Math.min(timeoutMs, 900000) }, (err) => {
+          if (err) return reject(new Error('下载失败：' + err.message));
+          resolve({ ok: true, path: dest, bytes: fs.statSync(dest).size, ms: Date.now() - started });
+        });
+    });
+  },
+
   async ps({ script, timeoutMs = 120000 } = {}) {
     if (!script || typeof script !== 'string') throw new Error('缺少 script');
     const ps = IS_WIN ? 'powershell.exe' : 'pwsh';
@@ -830,6 +875,9 @@ const server = http.createServer(async (req, res) => {
     if (route === 'caps') {
       json(res, 200, { ok: true, data: {
         exec: true, execMode: CONFIG.execMode,
+        // 把权限范围说清楚：agent 之前以为只能读用户目录，
+        // 于是用户说「要所有权限」时它回答「保持现状」，完全拧着来。
+        roots: (CONFIG.roots || []).length === 0 ? 'ALL_DRIVES' : (CONFIG.roots || []),
         powershell: true, batch: true,
         input: ['move', 'click', 'dblclick', 'down', 'up', 'scroll', 'type',
                 'key', 'keydown', 'keyup', 'release_all', 'foreground', 'focus'],
