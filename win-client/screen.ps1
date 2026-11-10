@@ -16,7 +16,8 @@
 param(
   [int]$Fps = 12,
   [int]$Quality = 55,
-  [double]$Scale = 0.5   # 缩小一半：1080p→960x540，流量降到 1/4，肉眼看监控够用
+    [double]$Scale = 1.0   # 默认原尺寸。缩一半时 2560x1288 会变成 1280x644，
+                        # 在手机小窗里看着糊；而且用户会觉得「只显示了部分」
 )
 
 $ErrorActionPreference = 'Stop'
