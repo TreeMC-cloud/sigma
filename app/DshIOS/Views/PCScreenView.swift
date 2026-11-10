@@ -162,9 +162,11 @@ final class MJPEGReceiver: NSObject {
     /// 而 URLSession 回调在后台线程，编译期会报
     /// 「call to main actor-isolated instance method in a synchronous nonisolated context」。
     /// 这里走 nonisolated 的 appendLine，任何线程都能调。
-    fileprivate static var counter = 0
-    fileprivate static var frames = 0
-    fileprivate static func log(_ text: String) {
+    // Swift 6 的严格并发检查不允许「可变 static」。
+    // 这两个只用于日志计数，竞争最多让数字差一，用 nonisolated(unsafe) 标注意图。
+    nonisolated(unsafe) fileprivate static var counter = 0
+    nonisolated(unsafe) fileprivate static var frames = 0
+    nonisolated fileprivate static func log(_ text: String) {
         let url = EnginePaths.real(EnginePaths.shared + "/app.log")
         let stamp = ISO8601DateFormatter().string(from: Date())
         Diagnostics.appendLine("[\(stamp)] 屏幕 · \(text)", to: url)
