@@ -47,6 +47,7 @@ node "$DSH_TOOLS/win-pc/pc.mjs" connect --code <配对码> --token <令牌>
 | **PowerShell** | `pc.mjs ps "Get-Process \| Sort CPU -Desc \| Select -First 5"` |
 | **批量** | `pc.mjs batch "命令1" "命令2" "命令3"` — 一次往返跑多条，省时间 |
 | **找文件** | `pc.mjs run "where /r C:\\Users *.pdf"` 或 `pc.mjs ps "Get-ChildItem -Recurse -Filter *.xlsx"` |
+| **下载文件** | `pc.mjs download <url> [保存路径]` — 大文件走这个，别用 run 调 curl |
 | **读文件** | `pc.mjs read "~/Documents/a.txt"` |
 | **写文件** | `pc.mjs write "~/a.txt" --content "内容"` 或 `--from 本地文件` |
 | **列目录** | `pc.mjs ls "~"` |
