@@ -87,19 +87,29 @@ function loadConfig() {
     // 无论哪种模式，每条命令都写审计日志。
     execMode: 'all',
     allowExec: [],
-    // 允许访问的根目录；默认是用户主目录。留空 = 不限制（不推荐）。
-    roots: [os.homedir()],
+    // 访问白名单。**留空 = 全盘可访问**（默认），要收紧就填具体目录。
+    roots: [],
     // 中继：跨网络时用。空字符串 = 只用局域网。
     relay: DEFAULT_RELAY,
-    // 配对码：固定下来便于「记住的设备」直接连；首次随机生成。
-    code: Array.from({ length: 6 }, () =>
-      'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[crypto.randomInt(32)]).join(''),
+    // 配对码：**由令牌派生，重装/重启都不变**。
+    // 之前是每次启动随机生成，用户重装客户端后手机上存的旧码就失效，
+    // 表现为「明明中继已上线却一直 404」——这个坑踩了好几次。
+    // 现在固定 = 令牌前 6 位转大写，装一百次都是同一个码。
+    code: '',   // 留空，下面用令牌算出来
   };
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 });
   return cfg;
 }
 
 const CONFIG = loadConfig();
+
+// 配对码永远由令牌派生：装一次和装一百次得到同一个码，
+// 用户手机上存的配置不会因为重装而失效。
+if (!CONFIG.code && CONFIG.token) {
+  const map = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const hex = crypto.createHash('sha256').update(CONFIG.token).digest();
+  CONFIG.code = Array.from({ length: 6 }, (_, i) => map[hex[i] % map.length]).join('');
+}
 
 // ── 工具 ──────────────────────────────────────────────────────────────
 function json(res, code, body) {
@@ -123,17 +133,32 @@ function tokenOk(given) {
 }
 
 /** 把相对路径解析到允许的根目录下，挡住 ../ 逃逸。 */
+/**
+ * 解析路径。
+ *
+ * **不再限制在用户主目录内。** 用户要的是「像坐在电脑前一样」的全部权限，
+ * 而主目录之外还有大量真实资料：`C:\Users\Public\Desktop`（公用桌面）、
+ * `D:\`（数据盘）、`C:\ProgramData`、网络共享……
+ * 之前的白名单只放行 home，于是「列桌面」只能看到 Administrator 的那一个，
+ * 公用桌面的快捷方式全被挡在外面——这不是权限问题，是我写错了。
+ *
+ * `roots` 现在只在**显式配置**时才作为白名单生效（留空 = 全盘可访问）。
+ */
 function safePath(p) {
-  // 先展开 ~：客户和模型都会写 `~\Documents`，不展开会变成「主目录下名叫 ~ 的目录」，
-  // 看起来成功、实际写到别处——这种错最难查。
+  // 先展开 ~：客户和模型都会写 `~\Documents`，不展开会变成「主目录下名叫 ~ 的目录」
   let raw = String(p || '.').trim();
   if (raw === '~') raw = os.homedir();
   else if (raw.startsWith('~/') || raw.startsWith('~\\')) raw = path.join(os.homedir(), raw.slice(2));
+  // 支持 %USERPROFILE% 这类 Windows 环境变量
+  if (IS_WIN) raw = raw.replace(/%([^%]+)%/g, (m, name) => process.env[name] ?? m);
   const abs = path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(os.homedir(), raw);
-  const roots = (CONFIG.roots || []).map((r) => path.resolve(r));
+
+  // 只有显式配置了 roots 才当白名单用；默认空 = 全盘
+  const roots = (CONFIG.roots || []).filter((r) => typeof r === 'string' && r.trim());
   if (roots.length === 0) return abs;
-  const ok = roots.some((r) => abs === r || abs.startsWith(r + path.sep));
-  if (!ok) throw new Error(`路径不在允许范围内：${abs}`);
+  const resolved = roots.map((r) => path.resolve(r));
+  const ok = resolved.some((r) => abs === r || abs.startsWith(r + path.sep));
+  if (!ok) throw new Error(`路径不在允许范围内：${abs}（roots: ${resolved.join(', ')}）`);
   return abs;
 }
 
