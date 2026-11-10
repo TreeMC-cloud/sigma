@@ -234,6 +234,23 @@ try {
     fs.writeFileSync(out, buf);
     console.log(`已取回 ${remote}`);
     console.log(`→ ${out}（${(buf.length/1024).toFixed(0)} KB${d.truncated ? '，已截断' : ''}）`);
+  } else if (cmd === 'pull') {
+    // 把电脑上的文件拉到手机上，落到 App 的附件目录，然后弹预览。
+    // 这是「让电脑做点东西给我」的最后一公里：做完 → 取回 → 直接看到。
+    const remote = pos[0];
+    if (!remote) throw new Error('用法：pull <电脑上的路径> [本地文件名]');
+    const name = pos[1] || path.basename(String(remote).replace(/\\/g, '/'));
+    const outDir = process.env.DSH_ATTACH_DIR || '/var/minis/attachments';
+    fs.mkdirSync(outDir, { recursive: true });
+    const out = path.join(outDir, name);
+
+    const d = await call(need(), 'read', { path: remote, maxBytes: 64 * 1024 * 1024, base64: true });
+    const buf = Buffer.from(d.content || '', 'base64');
+    if (!buf.length) throw new Error('取回的文件是空的（路径对不对？）');
+    fs.writeFileSync(out, buf);
+    console.log(`已取回 ${remote}`);
+    console.log(`→ ${out}（${(buf.length/1048576).toFixed(2)} MB${d.truncated ? '，已截断' : ''}）`);
+    console.log(`minis://attachments/${name}`);
   } else if (cmd === 'shot' || cmd === 'screenshot') {
     // 截一张全屏图，返回路径 + 尺寸 + 字节数。
     // 模型不支持图像输入，所以「看图」这条路走不通——
