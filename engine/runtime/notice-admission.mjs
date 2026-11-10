@@ -35,6 +35,9 @@ const ALWAYS = new Set([
 const THROTTLED = new Set([
   'turns',
   'repeat',
+  // 一般性提示（如「别盲等，每 2-3 秒看一眼」）。
+  // 之前不在任何名单里，被准入器静默丢弃——auto-guard 以为发了，用户看不到。
+  'note',
   'compaction',
   'dispatch',
   // 场景没配 / 配得不对：用户需要知道，但它每轮都会成立，
