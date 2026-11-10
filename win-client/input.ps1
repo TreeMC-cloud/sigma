@@ -140,12 +140,25 @@ switch ($Action) {
   }
 
   'type' {
-    # 中文必须走 SendKeys 的剪贴板外路径 —— 直接用 VkKeyScan 只能打英文。
-    # SendKeys 支持一部分 Unicode，但慢；对中文更可靠的是先写剪贴板再 Ctrl+V。
+    # 中文一律走剪贴板 + Ctrl+V。
+    #
+    # 为什么不直接 SendKeys：SendKeys 依赖当前键盘布局，中文机上是
+    # 美式布局 + 输入法，逐字符发送会被输入法吞掉或打出拼音。
+    # 剪贴板路径跟布局无关，中英混排也稳。
+    #
+    # 注意 $Text 本身的编码：脚本文件必须是 UTF-8（带 BOM），
+    # 否则 PowerShell 5 按 GBK 解析，中文字面量在加载时就坏了。
     if ($Text -match '[^\x00-\x7F]') {
+      $prev = $null
+      try { $prev = Get-Clipboard -Raw } catch { }
       Set-Clipboard -Value $Text
-      Start-Sleep -Milliseconds 120
+      Start-Sleep -Milliseconds 150
       [System.Windows.Forms.SendKeys]::SendWait('^v')
+      Start-Sleep -Milliseconds 80
+      # 尽量恢复用户原来的剪贴板，别把它覆盖掉
+      if ($null -ne $prev -and $prev.Length -lt 10000) {
+        try { Set-Clipboard -Value $prev } catch { }
+      }
     } else {
       [System.Windows.Forms.SendKeys]::SendWait($Text)
     }
