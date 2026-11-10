@@ -147,7 +147,7 @@ function proxyThrough(hostSocket, rawRequest, res) {
       res.writeHead(504);
       res.end('电脑没响应');
     }
-  }, 20000);
+  }, 120000);   // 120 秒：下载 200MB 安装包这类操作，20 秒根本不够
 
   st.pending = st.pending || new Map();
   st.pending.set(rid, (buf) => {
