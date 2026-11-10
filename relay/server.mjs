@@ -179,10 +179,13 @@ function proxyThrough(hostSocket, rawRequest, res) {
         if (['connection', 'transfer-encoding', 'keep-alive'].includes(k)) continue;
         outHeaders[k] = v;
       }
+      // multipart/x-mixed-replace 是无长度流：必须保持连接开着，
+      // 不能因为「没有 content-length」就当成已结束。
+      const isStream = /multipart\/x-mixed-replace/i.test(outHeaders['content-type'] || '');
       res.writeHead(status, outHeaders);
       sentHead = true;
       if (body.length) { res.write(body); got += body.length; }
-      if (need >= 0 && got >= need) finish();
+      if (!isStream && need >= 0 && got >= need) finish();
       return;
     }
     res.write(buf);
@@ -258,16 +261,36 @@ const server = http.createServer((req, res) => {
     const h = hosts.get(code);
     if (!h) { json(res, 404, { ok: false, error: '没有这个配对码' }); return; }
 
-    // 把请求体读完再发，避免 body 还没到就转发
+    // ⚠ 不要等 req.on('end')：GET 请求没有 body，某些情况下 end 迟迟不来，
+    // 代码就永远进不了 proxyThrough —— 表现是「App 连上了但一直转圈 / -1001」，
+    // 而且中继的 e502/e504 计数都是 0（根本没走到那一步）。
+    // 直接组好请求头发出去；有 body 的（POST）再补。
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('end', () => {
+    let sent = false;
+    const forward = () => {
+      if (sent) return;
+      sent = true;
       const body = Buffer.concat(chunks);
+      const headers = Object.entries(req.headers)
+        .filter(([k]) => !['host', 'connection', 'keep-alive', 'proxy-connection',
+                            'transfer-encoding', 'upgrade'].includes(k.toLowerCase()))
+        .map(([k, v]) => `${k}: ${v}`)
+        .join('\r\n');
       const head = `${req.method} ${pathPart} HTTP/1.1\r\n`
-        + Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n')
-        + '\r\n\r\n';
+        + `host: 127.0.0.1:${PORT}\r\n`
+        + headers + '\r\n'
+        + (body.length ? `content-length: ${body.length}\r\n` : '')
+        + 'connection: close\r\n\r\n';
       proxyThrough(h.socket, Buffer.concat([Buffer.from(head), body]), res);
-    });
+    };
+
+    // GET/HEAD 立刻转；其他方法等 body（但加 2 秒兜底，别无限等）
+    if (req.method === 'GET' || req.method === 'HEAD') forward();
+    else {
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', forward);
+      setTimeout(forward, 2000);
+    }
     return;
   }
 
