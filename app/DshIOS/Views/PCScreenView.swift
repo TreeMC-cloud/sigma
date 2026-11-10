@@ -186,6 +186,8 @@ final class MJPEGReceiver: NSObject, URLSessionDataDelegate {
                     didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         if let http = response as? HTTPURLResponse {
+            let ct = http.value(forHTTPHeaderField: "Content-Type") ?? "(无)"
+            Diagnostics.shared.record("屏幕", "响应 \(http.statusCode) · \(ct)")
             if http.statusCode == 401 { onError?("令牌不对"); completionHandler(.cancel); return }
             if http.statusCode != 200 { onError?("电脑返回 \(http.statusCode)"); completionHandler(.cancel); return }
             if let ct = http.value(forHTTPHeaderField: "Content-Type"),
@@ -197,9 +199,20 @@ final class MJPEGReceiver: NSObject, URLSessionDataDelegate {
         completionHandler(.allow)
     }
 
+    private var dataBatches = 0
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         buffer.append(data)
+        dataBatches += 1
+        if dataBatches <= 5 {
+            Diagnostics.shared.record("屏幕", "第 \(dataBatches) 批 \(data.count) 字节，缓冲 \(buffer.count)")
+        }
         extractFrames()
+        if dataBatches == 1, buffer.count > 0 {
+            // 第一批的首字节很关键：能看出服务端到底发了什么格式
+            let head = buffer.prefix(40).map { String(format: "%02x", $0) }.joined()
+            Diagnostics.shared.record("屏幕", "首字节 \(head)")
+        }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -207,6 +220,7 @@ final class MJPEGReceiver: NSObject, URLSessionDataDelegate {
         if let error {
             let ns = error as NSError
             if ns.code == NSURLErrorCancelled { return }
+            Diagnostics.shared.record("屏幕", "失败 \(ns.code) · \(ns.localizedDescription)")
             onError?("连接中断（\(ns.code)）")
         } else {
             onError?("电脑断开了连接")
