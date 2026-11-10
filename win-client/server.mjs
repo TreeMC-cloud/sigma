@@ -708,12 +708,24 @@ const server = http.createServer(async (req, res) => {
         'cache-control': 'no-store, no-cache, must-revalidate',
         'access-control-allow-origin': '*',
       });
-      // 立刻发一个 1x1 的占位 JPEG：不写任何字节的话，
-      // 上游（中继、iOS 的 URLSession）会认为「请求挂了但没响应」而超时。
-      // 这个占位帧让响应头立刻流出，真正的画面随后覆盖。
-      res.write(PLACEHOLDER_JPEG, () => {});
+
+      // ⚠ 必须立刻写点东西，否则 iOS 的 URLSession 会一直等第一块数据，
+      // 15 秒后抛 -1001（真机日志实测：收到 200 响应头，但 didReceive data
+      // 一次都没被调用）。先写占位帧拿到「响应头 + 首字节」，
+      // 真正的画面 1-2 秒后跟上。
       screenClients.add(res);
-      if (screenFrame) res.write(screenFrame, () => {});
+      const first = screenFrame || PLACEHOLDER_JPEG;
+      res.write(first, () => {});
+
+      // 如果采集还没起来，主动催一次，并把第一帧补发
+      if (!screenFrame) {
+        const timer = setTimeout(() => {
+          if (screenFrame && !res.writableEnded) {
+            try { res.write(screenFrame); } catch { /* 已断 */ }
+          }
+        }, 300);
+        timer.unref && timer.unref();
+      }
       req.on('close', () => { screenClients.delete(res); stopScreenIfIdle(); });
       return;
     }
