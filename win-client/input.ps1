@@ -215,9 +215,24 @@ switch ($Action) {
 
   'screenshot' {
     # 截全屏存到临时目录，返回路径。手机端拿去显示。
-    # 注意：当前模型未必支持图像输入，所以同时返回尺寸和大小，便于文字核对。
-    $out = if ($Text) { $Text } else { Join-Path $env:TEMP "sigma-shot-$(Get-Date -Format 'yyyyMMddHHmmss').png" }
+    #
+    # ⚠ 必须存到 $env:TEMP，不能落到桌面——真机日志里模型把
+    # `_sigma_shot.png` 写到了 C:\Users\Administrator\Desktop，
+    # 用户桌面上凭空多出一堆垃圾文件。
+    $stamp = Get-Date -Format 'yyyyMMddHHmmss'
+    $out = if ($Text) { $Text } else { Join-Path $env:TEMP "sigma-shot-$stamp.png" }
+
+    # ⚠ DPI：2560x1288 的屏在 200% 缩放下，VirtualScreen 只报 1280x644。
+    # 以驱动层分辨率为准，否则只截到左上角 1/4。
     $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    try {
+      $vc = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+            Where-Object { $_.CurrentHorizontalResolution -gt 0 } | Select-Object -First 1
+      if ($vc -and $vc.CurrentHorizontalResolution -gt $b.Width) {
+        $b = New-Object System.Drawing.Rectangle(0, 0, [int]$vc.CurrentHorizontalResolution, [int]$vc.CurrentVerticalResolution)
+      }
+    } catch { }
+
     $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size)
