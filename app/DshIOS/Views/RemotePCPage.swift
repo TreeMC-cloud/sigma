@@ -10,8 +10,11 @@ struct RemotePCPage: View {
     @State private var token = ""
     @State private var busy = false
     @State private var message: String?
-
     @State private var mode: Mode = .direct
+    /// 跨网络模式：6 位配对码
+    @State private var code = ""
+    /// 跨网络模式：中继地址（留空用内置）
+    @State private var relay = ""
 
     enum Mode: String, CaseIterable {
         case direct = "同一 Wi-Fi"
