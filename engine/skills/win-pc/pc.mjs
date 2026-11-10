@@ -234,6 +234,23 @@ try {
     fs.writeFileSync(out, buf);
     console.log(`已取回 ${remote}`);
     console.log(`→ ${out}（${(buf.length/1024).toFixed(0)} KB${d.truncated ? '，已截断' : ''}）`);
+  } else if (cmd === 'push') {
+    // 把手机上的文件（用户发来的附件、agent 生成的产物）传到电脑指定位置。
+    // 配合 pull 构成双向文件通道：pull = 电脑→手机，push = 手机→电脑。
+    const local = pos[0];
+    const remote = pos[1] || arg('--to');
+    if (!local || !remote) throw new Error('用法：push <本地路径> <电脑上的目标路径>');
+    if (!fs.existsSync(local)) throw new Error(`本地文件不存在：${local}`);
+
+    const buf = fs.readFileSync(local);
+    if (buf.length > 64 * 1024 * 1024) throw new Error(`文件太大（${(buf.length/1048576).toFixed(1)}MB，上限 64MB）`);
+
+    const d = await call(need(), 'write', {
+      path: remote,
+      content: buf.toString('base64'),
+      encoding: 'base64',
+    });
+    console.log(`已上传 ${path.basename(local)} → ${d.path}（${(d.bytes/1024).toFixed(0)} KB）`);
   } else if (cmd === 'pull') {
     // 把电脑上的文件拉到手机上，落到 App 的附件目录，然后弹预览。
     // 这是「让电脑做点东西给我」的最后一公里：做完 → 取回 → 直接看到。
@@ -251,6 +268,22 @@ try {
     console.log(`已取回 ${remote}`);
     console.log(`→ ${out}（${(buf.length/1048576).toFixed(2)} MB${d.truncated ? '，已截断' : ''}）`);
     console.log(`minis://attachments/${name}`);
+  } else if (cmd === 'psfile') {
+    // 从本地 .ps1 文件读脚本发过去执行。
+    //
+    // 为什么需要它：在 bash 里写 `pc.mjs ps "$b=...; $x.Read(...)"` 时，
+    // 反引号、$、引号要穿三层（bash → JSON → cmd → PowerShell），
+    // 真机日志里模型反复踩这个坑，写出来的命令变量名被吃掉，
+    // 拿到 `header=` 空值还不知道为什么。
+    // 写成文件再传，转义层数降到零。
+    const f = pos[0];
+    if (!f) throw new Error('用法：psfile <本地.ps1路径>');
+    if (!fs.existsSync(f)) throw new Error(`本地脚本不存在：${f}`);
+    const script = fs.readFileSync(f, 'utf8');
+    const d = await call(need(), 'ps', { script, timeoutMs: Number(arg('--timeout') || 180000) });
+    if (d.stdout) process.stdout.write(d.stdout);
+    if (d.stderr) process.stderr.write(d.stderr);
+    if (!d.ok) process.exitCode = 1;
   } else if (cmd === 'shot' || cmd === 'screenshot') {
     // 截一张全屏图，返回路径 + 尺寸 + 字节数。
     // 模型不支持图像输入，所以「看图」这条路走不通——
