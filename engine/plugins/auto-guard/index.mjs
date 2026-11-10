@@ -1509,6 +1509,30 @@ ctx.effect(() => {
   }
 
   onToolResult(session, event) {
+    // 检测「盲等」：sleep N（N>=10）然后才干活。
+    // 真机日志里模型反复 `sleep 60; ps Get-Process`，等一分钟不知道中间发生了什么。
+    // 正确做法是「动作 → 立刻看 → 再决定」。这里给它一个提醒。
+    try {
+      const name = String(event?.call?.name || event?.name || '');
+      if (name === 'bash' || name === 'shell') {
+        const cmd = String(event?.call?.arguments?.command || event?.call?.args?.command || '');
+        const m = cmd.match(/\bsleep\s+(\d+)/);
+        if (m && Number(m[1]) >= 10) {
+          const s2 = this.runtime(session);
+          s2.blindWaits = (s2.blindWaits ?? 0) + 1;
+          if (s2.blindWaits <= 2) {
+            this.notify(
+              `刚执行了 sleep ${m[1]} 秒。与其盲等，不如每 2-3 秒看一眼：`
+              + `截图（shot）、查进程、查文件大小。`
+              + `「等」只在知道要等多久时才用。`,
+              { kind: 'note', session: sessionId(session) }
+            );
+          }
+        }
+      }
+    } catch { /* 检测失败不影响主流程 */ }
+
+
     const s = this.runtime(session);
     // 用户是不是在重复同一个抱怨。
     // 放在这里而不是 turn/start：turn/start 时本轮的 user/message 还没落盘，
