@@ -35,7 +35,7 @@ const FAIL_WINDOW_MS = 10 * 60_000;
 /** code -> { socket, meta, timer } */
 const hosts = new Map();
 // 运行时计数：挂到 /health 里，不依赖日志文件就能看出来到底转没转
-const stat = { framesIn: 0, framesFwd: 0, binds: 0, errors: [], sample: [], e502: 0, e504: 0 };
+const stat = { framesIn: 0, framesFwd: 0, binds: 0, errors: [], sample: [], e502: 0, e504: 0, reqSent: 0, resGot: 0 };
 /** ip -> { fails, until } */
 const fails = new Map();
 
@@ -198,6 +198,14 @@ function proxyThrough(hostSocket, rawRequest, res) {
   try {
     hostSocket.write(frame(Buffer.from(JSON.stringify({ type: 'req', rid })), 0x1));
     hostSocket.write(frame(rawRequest, 0x2));
+    stat.reqSent += 1;
+    if (process.env.SIGMA_RELAY_DEBUG && stat.reqSent <= 4) {
+      console.error(`[req] rid=${rid} 原文:\n${rawRequest.toString('latin1').slice(0, 400)}`);
+    }
+    if (stat.reqSent <= 3) {
+      stat.sample.push({ dir: 'req', rid, bytes: rawRequest.length,
+        head: rawRequest.subarray(0, 60).toString('latin1').replace(/[^\x20-\x7e]/g,'.') });
+    }
   } catch (e) {
     cleanup();
     stat.e502 += 1;
@@ -271,25 +279,35 @@ const server = http.createServer((req, res) => {
       if (sent) return;
       sent = true;
       const body = Buffer.concat(chunks);
+      // ⚠ 必须过滤掉 content-length：请求头里已经有一份，
+      // 我们再补一份就变成重复头，HTTP 服务器会直接回 400 Bad Request。
+      // 这个 bug 的表现是「GET 全通、POST 全 400」，很难从表面看出来。
       const headers = Object.entries(req.headers)
         .filter(([k]) => !['host', 'connection', 'keep-alive', 'proxy-connection',
-                            'transfer-encoding', 'upgrade'].includes(k.toLowerCase()))
+                            'transfer-encoding', 'upgrade', 'content-length']
+                            .includes(k.toLowerCase()))
         .map(([k, v]) => `${k}: ${v}`)
         .join('\r\n');
       const head = `${req.method} ${pathPart} HTTP/1.1\r\n`
         + `host: 127.0.0.1:${PORT}\r\n`
         + headers + '\r\n'
+        // 只在这里写一次，且只在真有 body 时写
         + (body.length ? `content-length: ${body.length}\r\n` : '')
         + 'connection: close\r\n\r\n';
       proxyThrough(h.socket, Buffer.concat([Buffer.from(head), body]), res);
     };
 
-    // GET/HEAD 立刻转；其他方法等 body（但加 2 秒兜底，别无限等）
-    if (req.method === 'GET' || req.method === 'HEAD') forward();
-    else {
+    // GET/HEAD 没有 body，立刻转。
+    // 其他方法（POST）必须**等 body 收完**——2 秒兜底是错的：
+    // 它会在 body 还没到时抢先转发一个空请求，客户端拿到的是
+    // `{"path":undefined}` 之类，然后卡住不回，最终超时。
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      forward();
+    } else {
       req.on('data', (c) => chunks.push(c));
       req.on('end', forward);
-      setTimeout(forward, 2000);
+      // 只防「end 永远不来」的极端情况，给足 10 秒；正常 POST 都是毫秒级
+      req.on('error', forward);
     }
     return;
   }
@@ -361,12 +379,40 @@ function attach(socket) {
       // 已配对：字节原样转给对面。不解析——host 上是 HTTP，
       // 我们只当管道，任何解析都会引入新问题。
       stat.framesIn += 1;
+
+      // ⚠ 控制消息必须最先处理。
+      // 之前 st.peer 分支在前，host 发来的 {"type":"res"} 被当成业务数据
+      // 直接转给 client，下面的解析永远走不到 —— 表现是
+      // 「GET 正常（一次响应就结束），POST 全部超时」。
+      if (st.role === 'host' && f.opcode === 0x1) {
+        let ctrl = null;
+        try { ctrl = JSON.parse(f.payload.toString()); } catch { /* 非控制消息 */ }
+        if (ctrl && ctrl.type === 'res') {
+          st.curRid = ctrl.rid;
+          stat.resGot += 1;
+          continue;
+        }
+        if (ctrl && ctrl.type === 'end') {
+          if (st.curRid === ctrl.rid) st.curRid = undefined;
+          continue;
+        }
+      }
+
       // 多路复用：文本帧里带 rid，二进制帧紧跟其后
+      if (process.env.SIGMA_RELAY_DEBUG) {
+        console.error(`[frm] role=${st.role} op=${f.opcode} len=${f.payload.length} curRid=${st.curRid} pending=${st.pending ? [...st.pending.keys()] : 'none'} text=${f.payload.subarray(0,30).toString('utf8').replace(/[^\x20-\x7e]/g,'.')}`);
+      }
       if (st.curRid !== undefined) {
         const fn = st.pending && st.pending.get(st.curRid);
+        if (process.env.SIGMA_RELAY_DEBUG) {
+          console.error(`[fwd] rid=${st.curRid} len=${f.payload.length} fn=${!!fn} pending=${st.pending ? [...st.pending.keys()] : []}`);
+        }
         if (fn) fn(f.payload);
         st.curRid = undefined;
         continue;
+      }
+      if (process.env.SIGMA_RELAY_DEBUG) {
+        console.error(`[drop] 无 curRid 的二进制帧 len=${f.payload.length}`);
       }
       if (st.peer) {
         stat.framesFwd += 1;
@@ -403,6 +449,7 @@ function attach(socket) {
           st.role = 'host';
           st.code = c;
           hosts.set(c, { socket, createdAt: Date.now(), meta: msg.meta || {} });
+          if (process.env.SIGMA_RELAY_DEBUG) console.error(`[reg] 发 registered code=${c} closed=${st.closed}`);
           sendText({ type: 'registered', code: c });
         } else if (msg.role === 'client') {
           const c = String(msg.code || '').toUpperCase().slice(0, 8);
@@ -436,7 +483,7 @@ function attach(socket) {
       if (st.role === 'host') {
         let msg;
         try { msg = JSON.parse(f.payload.toString()); } catch { continue; }
-        if (msg.type === 'res') { st.curRid = msg.rid; continue; }
+        if (msg.type === 'res') { st.curRid = msg.rid; stat.resGot += 1; continue; }
         if (msg.type === 'end') {
           const fn = st.pending && st.pending.get(msg.rid);
           // 通知这个请求的连接可以收了：不主动 end，交给 Content-Length 判断，
