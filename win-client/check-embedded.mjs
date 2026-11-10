@@ -38,8 +38,10 @@ for (const [constName, fileName] of PAIRS) {
     console.log(`⚠ ${fileName} 不存在，跳过`);
     continue;
   }
-  const disk = fs.readFileSync(file, 'utf8');
-  const emb = embedded(constName);
+  // 统一去掉 \r：Windows 上 checkout 出来的文件可能是 CRLF，
+  // 而常量是 LF。比的是「内容」，不是「行为什么换行符」。
+  const disk = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+  const emb = embedded(constName).replace(/\r\n/g, '\n');
 
   if (disk === emb) {
     console.log(`✓ ${constName} 与 ${fileName} 一致（${disk.length} 字符）`);
