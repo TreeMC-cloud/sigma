@@ -519,8 +519,13 @@ function ensureScreen() {
         if (line.startsWith('--FRAME ')) {
           need = Number(line.slice(8)) || 0;
         } else if (line.startsWith('--READY ')) {
-          const [, w, h, fps] = line.split(' ');
-          screenInfo = { w: Number(w), h: Number(h), fps: Number(fps) };
+          const [, w, h, fps, sw, sh] = line.split(' ');
+          screenInfo = { w: Number(w), h: Number(h), fps: Number(fps),
+            screenW: Number(sw) || null, screenH: Number(sh) || null };
+          // 采集尺寸 ≠ 物理尺寸 → DPI 感知没生效，画面会只截到一角
+          if (sw && Number(sw) !== Number(w)) {
+            console.log(`  ⚠ 屏幕 ${sw}x${sh} 但采集只有 ${w}x${h}（DPI 未生效）`);
+          }
         } else if (line.startsWith('--ERROR ')) {
           screenErr = line.slice(8);
         } else if (line.trim() === '') {
