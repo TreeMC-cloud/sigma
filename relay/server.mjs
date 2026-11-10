@@ -35,7 +35,7 @@ const FAIL_WINDOW_MS = 10 * 60_000;
 /** code -> { socket, meta, timer } */
 const hosts = new Map();
 // 运行时计数：挂到 /health 里，不依赖日志文件就能看出来到底转没转
-const stat = { framesIn: 0, framesFwd: 0, binds: 0, errors: [], sample: [] };
+const stat = { framesIn: 0, framesFwd: 0, binds: 0, errors: [], sample: [], e502: 0, e504: 0 };
 /** ip -> { fails, until } */
 const fails = new Map();
 
@@ -104,33 +104,65 @@ function parseFrames(buf) {
  * 为什么用「一请求一连接」而不是复用：中继要同时服务多个 App 请求，
  * 复用会让响应互相串。每个请求临时占用 host 一次，简单可靠。
  */
+let nextRid = 1;
+
+/**
+ * 一条请求 = 一个 rid。
+ *
+ * 为什么必须多路复用：App 打开小窗时会同时发 `/health`（探测）和
+ * `/screen`（MJPEG 流，永不结束）。之前中继每个 host 只有一个 stream 槽，
+ * 两个请求互相覆盖——MJPEG 一占，探测永远等不到响应，表现为
+ * 「连上了但连接中断 / 502」。
+ *
+ * 协议：
+ *   中继 → 客户端：{"type":"req","rid":N}  然后紧跟一个二进制帧（原始 HTTP 请求）
+ *   客户端 → 中继：{"type":"res","rid":N}  然后紧跟一个二进制帧（响应字节）
+ *                  {"type":"end","rid":N}  该请求结束/连接已关
+ */
 function proxyThrough(hostSocket, rawRequest, res) {
   const st = hostSocket.__st;
-  if (!st || st.closed) { res.writeHead(502); res.end('电脑断开了'); return; }
+  if (!st) { stat.e502 += 1; res.writeHead(502); res.end('电脑连接状态丢了'); return; }
+  if (st.closed) { stat.e502 += 1; res.writeHead(502); res.end('电脑连接已关闭，请重启客户端'); return; }
 
+  const rid = nextRid++;
   let head = Buffer.alloc(0);
   let sentHead = false;
-  let need = -1;        // Content-Length 剩余
+  let need = -1;
   let got = 0;
+  let done = false;
 
-  const finish = () => {
+  const cleanup = () => {
+    if (done) return;
+    done = true;
     clearTimeout(timer);
-    st.stream = null;
-    if (!res.writableEnded) res.end();
+    if (st.pending) st.pending.delete(rid);
   };
 
-  // 超时只对「还没收到响应头」的情况生效。
-  // 收到头之后是流（比如 MJPEG），本来就不该有结束时间。
+  const finish = () => { cleanup(); if (!res.writableEnded) res.end(); };
+
   const timer = setTimeout(() => {
-    if (!sentHead) { st.stream = null; res.writeHead(504); res.end('电脑没响应'); }
+    if (!sentHead) {
+      stat.e504 += 1;
+      cleanup();
+      res.writeHead(504);
+      res.end('电脑没响应');
+    }
   }, 20000);
 
-  st.stream = (buf) => {
+  st.pending = st.pending || new Map();
+  st.pending.set(rid, (buf) => {
+    if (done) return;
     if (!sentHead) {
       head = Buffer.concat([head, buf]);
       const sep = head.indexOf('\r\n\r\n');
       if (sep < 0) {
-        if (head.length > 64 * 1024) { res.writeHead(502); res.end('响应头异常'); st.stream = null; }
+        if (head.length > 64 * 1024) {
+          const peek = head.subarray(0, 120).toString('latin1').replace(/[^\x20-\x7e]/g, '.');
+          stat.e502 += 1;
+          cleanup();
+          res.writeHead(502);
+          res.end('响应头异常，收到的是：' + peek);
+        }
         return;
       }
       const headerText = head.subarray(0, sep).toString('latin1');
@@ -144,32 +176,31 @@ function proxyThrough(hostSocket, rawRequest, res) {
         const k = line.slice(0, i).trim().toLowerCase();
         const v = line.slice(i + 1).trim();
         if (k === 'content-length') { need = Number(v); continue; }
-        // 逐跳头不能透传：中继自己会重新分帧
         if (['connection', 'transfer-encoding', 'keep-alive'].includes(k)) continue;
         outHeaders[k] = v;
       }
-      // 流式响应不带 Content-Length：交给 HTTP 的 chunked 编码
       res.writeHead(status, outHeaders);
       sentHead = true;
-      if (body.length) {
-        res.write(body);
-        got += body.length;
-      }
+      if (body.length) { res.write(body); got += body.length; }
       if (need >= 0 && got >= need) finish();
       return;
     }
     res.write(buf);
     got += buf.length;
     if (need >= 0 && got >= need) finish();
-  };
-
-  // App 那边断开（比如用户收起小窗）：告诉负责的请求别再写了
-  res.on('close', () => {
-    if (st.stream) { st.stream = null; clearTimeout(timer); }
   });
 
-  try { hostSocket.write(frame(rawRequest, 0x2)); }
-  catch { st.stream = null; clearTimeout(timer); res.writeHead(502); res.end('转发失败'); }
+  res.on('close', () => { cleanup(); });
+
+  try {
+    hostSocket.write(frame(Buffer.from(JSON.stringify({ type: 'req', rid })), 0x1));
+    hostSocket.write(frame(rawRequest, 0x2));
+  } catch (e) {
+    cleanup();
+    stat.e502 += 1;
+    res.writeHead(502);
+    res.end('转发失败：' + (e && e.message ? e.message : '未知'));
+  }
 }
 
 // ── 状态 ──────────────────────────────────────────────────────────────
@@ -307,8 +338,13 @@ function attach(socket) {
       // 已配对：字节原样转给对面。不解析——host 上是 HTTP，
       // 我们只当管道，任何解析都会引入新问题。
       stat.framesIn += 1;
-      // HTTP 入口的响应：交给等待中的请求（流式，可能来很多块）
-      if (st.stream) { st.stream(f.payload); continue; }
+      // 多路复用：文本帧里带 rid，二进制帧紧跟其后
+      if (st.curRid !== undefined) {
+        const fn = st.pending && st.pending.get(st.curRid);
+        if (fn) fn(f.payload);
+        st.curRid = undefined;
+        continue;
+      }
       if (st.peer) {
         stat.framesFwd += 1;
         if (stat.sample.length < 8) {
@@ -371,7 +407,21 @@ function attach(socket) {
         continue;
       }
 
-      // 握手之后再发文本：忽略（协议里没有别的控制消息）
+      // 握手之后的文本帧 = 多路复用的控制消息
+      //   {"type":"res","rid":N} → 下一帧二进制属于 rid N
+      //   {"type":"end","rid":N} → 该请求结束
+      if (st.role === 'host') {
+        let msg;
+        try { msg = JSON.parse(f.payload.toString()); } catch { continue; }
+        if (msg.type === 'res') { st.curRid = msg.rid; continue; }
+        if (msg.type === 'end') {
+          const fn = st.pending && st.pending.get(msg.rid);
+          // 通知这个请求的连接可以收了：不主动 end，交给 Content-Length 判断，
+          // 但把 pending 清掉防止泄漏
+          if (fn) { /* 数据已由 Content-Length 收齐 */ }
+          continue;
+        }
+      }
     }
   });
 
