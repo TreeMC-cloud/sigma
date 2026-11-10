@@ -160,9 +160,16 @@ final class MJPEGReceiver: NSObject, URLSessionDataDelegate {
         self.token = token
         super.init()
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 15
-        // 流是长连接，别让系统因为「没有新字节」而超时掐断
+        // ⚠ 这两个超时是流式请求的关键，之前配错了：
+        //   timeoutIntervalForRequest 是「两次数据之间的最大间隔」，
+        //     设 15 秒意味着只要服务端 15 秒内没发下一个字节就断——
+        //     MJPEG 在锁屏/静止画面时正好会这样，于是 -1001。
+        //   timeoutIntervalForResource 是「整个请求的总时长」，流要设成无限。
+        cfg.timeoutIntervalForRequest = 60
         cfg.timeoutIntervalForResource = .greatestFiniteMagnitude
+        // 不要让系统为了省电把长连接挂起
+        cfg.httpShouldUsePipelining = false
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     }
 
