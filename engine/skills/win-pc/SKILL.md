@@ -135,7 +135,13 @@ node "$DSH_TOOLS/win-pc/pc.mjs" connect --code <配对码> --token <令牌>
 | 下载的安装包 | `$env:USERPROFILE\Downloads\` |
 | 解压出来的工具 | `$env:LOCALAPPDATA\sigma-tools\` |
 | 截图 | `$env:TEMP\`（`pc.mjs shot` 已经这么做了） |
-| **绝对不要** | `C:\Users\<用户>\` 根目录、桌面 |
+| **绝对不要** | `C:\Users\<用户>\` 根目录、桌面、**`C:\` 根目录** |
+
+真机日志里为了给 Blender 配软件渲染，在 **`C:\mesa`** 建了目录——C 盘根。
+那是最不该动的地方：系统的、用户的、各个软件的都挤在那儿，多一个陌生
+目录用户一眼就能看到，而且卸载时没人会记得删。
+
+工具类东西一律 `%LOCALAPPDATA%\sigma-tools\<名字>\`。
 
 写完临时脚本要在收尾时删掉：
 
