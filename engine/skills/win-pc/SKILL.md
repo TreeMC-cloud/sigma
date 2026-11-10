@@ -49,6 +49,8 @@ node "$DSH_TOOLS/win-pc/pc.mjs" connect --code <配对码> --token <令牌>
 | **找文件** | `pc.mjs run "where /r C:\\Users *.pdf"` 或 `pc.mjs ps "Get-ChildItem -Recurse -Filter *.xlsx"` |
 | **下载文件** | `pc.mjs download <url> [保存路径]` — 大文件走这个，别用 run 调 curl |
 | **读文件** | `pc.mjs read "~/Documents/a.txt"` |
+| **取回文件** | `pc.mjs fetch "C:/.../shot.png" --out /tmp/shot.png` — 截图/产物拉到本地 |
+| **截图** | `pc.mjs shot` — 返回路径+尺寸+字节数 |
 | **写文件** | `pc.mjs write "~/a.txt" --content "内容"` 或 `--from 本地文件` |
 | **列目录** | `pc.mjs ls "~"` |
 | **看屏幕** | 对话页顶部小窗；或 `pc.mjs run` 里查 |
