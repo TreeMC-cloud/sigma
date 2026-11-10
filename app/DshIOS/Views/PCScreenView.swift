@@ -282,7 +282,7 @@ struct PCScreenDock: View {
                 VStack(spacing: 0) {
                     header
                     if expanded {
-                        PCScreenView(baseURL: link.baseURL, token: link.token)
+                        PCScreenView(baseURL: link.effectiveBase, token: link.token)
                             .aspectRatio(16.0 / 9.0, contentMode: .fit)
                             .padding(.horizontal, 10)
                             .padding(.bottom, 8)
