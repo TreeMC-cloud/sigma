@@ -69,11 +69,37 @@ function holdDescriptors(stdio) {
   return [...copies].filter(([fd, copy]) => fd !== copy).map(([, copy]) => copy);
 }
 
-/** Writes straight to a descriptor, so the bytes are there once the child exits. */
+/**
+ * Writes straight to a descriptor, so the bytes are there once the child exits.
+ *
+ * ⚠ ENXIO 容错：子进程退出后，它那条管道的读端就没了。这时再 writeSync
+ * 会抛 ENXIO（errno -6，"no such device or address"）。原来直接 callback(error)
+ * 把错误抛给 Writable，没人接 → uncaughtException → **整个引擎退出**。
+ *
+ * 真机日志：装一个插件（pnpm 输出很多），引擎连续崩 12 次，App 打不开。
+ *
+ * 这里改成：写完就完成，失败也只当「这条管道没了」，不向上抛。
+ * 日志丢失是可接受的；引擎崩溃不是。
+ */
 function fdSink(fd) {
+  let dead = false;
   return new Writable({
     write(chunk, encoding, callback) {
-      try { fs.writeSync(fd, chunk); callback(); } catch (error) { callback(error); }
+      if (dead) { callback(); return; }
+      try {
+        fs.writeSync(fd, chunk);
+      } catch (error) {
+        // ENXIO / EPIPE / EBADF：管道已关闭，标记为死并静默丢弃后续写入
+        if (error && (error.code === 'ENXIO' || error.code === 'EPIPE' || error.code === 'EBADF')) {
+          dead = true;
+          callback();
+          return;
+        }
+        // 其它错误也只记不抛：这里丢一行日志，远好过整个引擎挂掉
+        callback();
+        return;
+      }
+      callback();
     },
   });
 }
