@@ -340,6 +340,96 @@ sc.render.resolution_y = 1000
 
 **四个里缺两个以上，用户一定会说「太卡通」。**
 
+## 骨骼动画：先用实测轴，别按世界坐标假设
+
+真机日志里连续踩了六个坑，全部同一个根因：
+
+> 用户：「四肢动作反了！我往前走你动作是朝后的动作」
+> 用户：「走路时候腿和身体怎么感觉会左右乱晃？」
+> 用户：「静止不动时候动画没有衔接上，播放完了会突然的停」
+
+模型自己的结论：
+
+> **做骨骼动画前必须先实测骨骼的局部旋转轴，不能按世界坐标假设。**
+
+### 为什么
+
+Blender 的 `pose_bone.rotation_euler` 用的是**骨骼局部坐标系**，
+每条骨骼的轴方向都不一样（取决于建模时的朝向和 roll）。
+按世界坐标写 `X=抬腿` 可能实际是「向外撇」。
+
+### 怎么实测
+
+```python
+import bpy, mathutils
+
+def probe_bone_axis(arm_name, bone_name, axis='X', deg=20):
+    """让骨头绕某轴转一下，看包围盒往哪个方向变，就知道那个轴是什么。"""
+    arm = bpy.data.objects[arm_name]
+    pb = arm.pose.bones[bone_name]
+    pb.rotation_mode = 'XYZ'
+
+    before = [v.co.copy() for v in arm.data.vertices] if False else None
+    # 用骨骼自己的子物体包围盒变化判断
+    def bbox():
+        pts = [arm.matrix_world @ pb.head, arm.matrix_world @ pb.tail]
+        return pts[0].z, pts[1].z
+
+    z0 = bbox()
+    setattr(pb.rotation_euler, axis.lower(), math.radians(deg))
+    bpy.context.view_layer.update()
+    z1 = bbox()
+    setattr(pb.rotation_euler, axis.lower(), 0)
+    bpy.context.view_layer.update()
+
+    dz = z1[1] - z0[1]
+    return {'axis': axis, 'dz': round(dz, 4),
+            'effect': 'lifts' if dz > 0.001 else ('drops' if dz < -0.001 else 'lateral')}
+```
+
+对大腿、小腿、手臂各跑一次 X/Y/Z，记下来哪根轴是「前后摆」。
+
+### 六类必查问题
+
+| 现象 | 根因 | 检查 |
+|---|---|---|
+| 走路方向反了 | 轴的方向（正负）搞反 | 确认 `+angle` 是前摆还是后摆 |
+| 左右乱晃 | 用错轴（Y 当 X） | 实测三轴效果 |
+| 静止时抖一下 | 四元数插值跳变 | 用 `rotation_mode='QUATERNION'` + 连续性修正 |
+| 循环接缝跳变 | 半周期 `sin(π·t)` 不闭合 | 必须 `sin(2π·t)` |
+| 播放完突然停 | 首尾关键帧不等 | 逐 fcurve 比对首末值 |
+| t=0 处无数据 | 关键帧从第 1 帧开始 | 强制从第 0 帧开始 |
+
+### 循环动画自检清单（五条，每条都能失败）
+
+```
+① 周期函数用整周期 sin(2π·t)——半周期在 t=1 时不闭合，接缝跳变
+② 首尾关键帧值完全相等（逐 fcurve 比对 kps[0] vs kps[-1]，差 >1e-4 报警）
+③ 关键帧必须从第 0 帧开始，否则 GLB 里 t=0 处无数据
+④ 四元数要连续性修正（q 和 -q 表示同一旋转，插值可能走远路）
+⑤ 循环长度 = 关键帧跨度，不是最后一帧的序号
+```
+
+检查代码：
+
+```python
+def check_loop_seam(action, eps=1e-4):
+    bad = []
+    for fc in action.fcurves:
+        kps = fc.keyframe_points
+        if len(kps) < 2: continue
+        first, last = kps[0].co[1], kps[-1].co[1]
+        if abs(first - last) > eps:
+            bad.append({'curve': f'{fc.data_path}[{fc.array_index}]',
+                        'first': round(first,5), 'last': round(last,5)})
+        if abs(kps[0].co[0]) > 1e-6:
+            bad.append({'curve': fc.data_path, 'issue': 'not_start_at_0',
+                        'start_frame': kps[0].co[0]})
+    return bad
+```
+
+**这个函数非空就说明循环会跳。**
+
 ## 渲染前先估算时间
 
 ```python
