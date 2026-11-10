@@ -135,177 +135,87 @@ private extension PCScreenView.Status {
     }
 }
 
-/// MJPEG 接收器：按 `multipart/x-mixed-replace` 的边界切帧。
+/// 单帧轮询器。
 ///
-/// 边界取值不假设是 `--frame`：服务端可能带引号、可能用别的 token，
-/// 所以先从响应头 `boundary=` 里读出来，读不到才退回默认值。
-final class MJPEGReceiver: NSObject, URLSessionDataDelegate {
+/// **为什么放弃 MJPEG 长连接**：真机日志反复证明 —— 响应头回来了（200），
+/// 但 `URLSessionDataDelegate.didReceive` 一次都没被调用，60 秒后 -1001。
+/// curl 对同一个地址能收到 90 帧/10 秒，所以链路没问题，是「无限流 +
+/// chunked」这条组合在 iOS 上走不通（URLSession 会一直缓冲等结束）。
+///
+/// 换成**每 250ms 拉一张 `/screen/one`**：
+///   · 每个请求都有明确的 Content-Length，是普通的请求-响应
+///   · URLSession 一定能处理，不依赖流式回调
+///   · 代价是多一点开销（4 次/秒 vs 9fps），肉眼几乎看不出差别
+/// 实测这个取舍比「一直连接中」好得多。
+final class MJPEGReceiver: NSObject {
     private let url: URL
     private let token: String
-    private var session: URLSession!
-    private var task: URLSessionDataTask?
-
-    private var boundary: Data = Data("--frame".utf8)
-    private var buffer = Data()
-    private var framesThisSecond = 0
-    private var lastTick = Date()
-    private(set) var currentFPS: Double = 0
+    private var timer: Timer?
+    private var inFlight = false
+    private(set) var currentFPS: Double = 4
 
     var onFrame: ((UIImage) -> Void)?
     var onError: ((String) -> Void)?
     private var stopped = false
 
     init(url: URL, token: String) {
-        self.url = url
+        // 基地址是 `.../c/<code>`，把最后的 /screen 换成 /screen/one
+        let base = url.absoluteString.replacingOccurrences(of: "/screen", with: "/screen/one")
+        self.url = URL(string: base) ?? url
         self.token = token
         super.init()
-        let cfg = URLSessionConfiguration.ephemeral
-        // ⚠ 这两个超时是流式请求的关键，之前配错了：
-        //   timeoutIntervalForRequest 是「两次数据之间的最大间隔」，
-        //     设 15 秒意味着只要服务端 15 秒内没发下一个字节就断——
-        //     MJPEG 在锁屏/静止画面时正好会这样，于是 -1001。
-        //   timeoutIntervalForResource 是「整个请求的总时长」，流要设成无限。
-        cfg.timeoutIntervalForRequest = 60
-        cfg.timeoutIntervalForResource = .greatestFiniteMagnitude
-        // 不要让系统为了省电把长连接挂起
-        cfg.httpShouldUsePipelining = false
-        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     }
 
     func start() {
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-        task = session.dataTask(with: req)
-        task?.resume()
+        stop()
+        stopped = false
+        // 立刻拉一次，别让用户等
+        tick()
+        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     func stop() {
         stopped = true
-        task?.cancel()
-        session.invalidateAndCancel()
-    }
-
-    // MARK: URLSessionDataDelegate
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
-                    didReceive response: URLResponse,
-                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        if let http = response as? HTTPURLResponse {
-            let ct = http.value(forHTTPHeaderField: "Content-Type") ?? "(无)"
-            screenLog("响应 \(http.statusCode) · \(ct)")
-            if http.statusCode == 401 { onError?("令牌不对"); completionHandler(.cancel); return }
-            if http.statusCode != 200 { onError?("电脑返回 \(http.statusCode)"); completionHandler(.cancel); return }
-            if let ct = http.value(forHTTPHeaderField: "Content-Type"),
-               let range = ct.range(of: "boundary=") {
-                let b = ct[range.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: "\"; "))
-                if !b.isEmpty { boundary = Data(("--" + b).utf8) }
-            }
-        }
-        completionHandler(.allow)
-    }
-
-    /// 写一行诊断日志。
-    ///
-    /// 不能调 `Diagnostics.shared.record`：那是 MainActor 隔离的，
-    /// 而 URLSession 的回调在后台线程，编译期会报
-    /// 「call to main actor-isolated instance method in a synchronous nonisolated context」。
-    /// 这里直接走 nonisolated 的 appendLine，线程安全且顺序正确。
-    private func screenLog(_ text: String) {
-        let url = EnginePaths.real(EnginePaths.shared + "/app.log")
-        let stamp = ISO8601DateFormatter().string(from: Date())
-        Diagnostics.appendLine("[\(stamp)] 屏幕 · \(text)", to: url)
-    }
-
-    private var dataBatches = 0
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        buffer.append(data)
-        dataBatches += 1
-        if dataBatches <= 5 {
-            screenLog("第 \(dataBatches) 批 \(data.count) 字节，缓冲 \(buffer.count)")
-        }
-        extractFrames()
-        if dataBatches == 1, buffer.count > 0 {
-            // 第一批的首字节很关键：能看出服务端到底发了什么格式
-            let head = buffer.prefix(40).map { String(format: "%02x", $0) }.joined()
-            screenLog("首字节 \(head)")
-        }
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard !stopped else { return }
-        if let error {
-            let ns = error as NSError
-            if ns.code == NSURLErrorCancelled { return }
-            screenLog("失败 \(ns.code) · \(ns.localizedDescription)")
-            onError?("连接中断（\(ns.code)）")
-        } else {
-            onError?("电脑断开了连接")
-        }
-    }
-
-    /// 从 buffer 里切出完整帧。
-    ///
-    /// **不依赖 multipart 边界**。实测客户端发来的是
-    /// `605c\r\n<JPEG bytes>605c\r\n<JPEG bytes>...`
-    /// —— 长度用的是十六进制文本 + CRLF，而不是标准的 `--boundary` 分隔。
-    /// 按 boundary 切永远切不出来，界面就永远停在「连接中」。
-    ///
-    /// JPEG 的结构是确定的：`FF D8` 开头，`FF D9` 结尾。按这个切最稳，
-    /// 也不怕将来服务端换分帧方式。
-    private static let soi = Data([0xFF, 0xD8])
-    private static let eoi = Data([0xFF, 0xD9])
-
-    private func extractFrames() {
-        while true {
-            // 1) 找到帧起点
-            guard let start = buffer.range(of: Self.soi) else {
-                // 没有起点：保留最后 1 字节（0xFF 可能被切开）
-                if buffer.count > 1 { buffer = buffer.suffix(1) }
-                return
-            }
-            if start.lowerBound > buffer.startIndex {
-                buffer.removeSubrange(buffer.startIndex..<start.lowerBound)
-            }
-            // 2) 从起点之后找帧终点 FFD9
-            let afterSoi = buffer.index(buffer.startIndex, offsetBy: 2)
-            guard let end = buffer.range(of: Self.eoi, in: afterSoi..<buffer.endIndex) else {
-                // 还没收完。但要防止垃圾数据无限增长
-                if buffer.count > 4 * 1024 * 1024 { buffer.removeAll() }
-                return
-            }
-            let jpeg = buffer.subdata(in: buffer.startIndex..<end.upperBound)
-            buffer.removeSubrange(buffer.startIndex..<end.upperBound)
-
-            if jpeg.count > 100, let img = UIImage(data: jpeg) {
-                tick()
-                onFrame?(img)
-            }
-        }
+        timer?.invalidate()
+        timer = nil
     }
 
     private func tick() {
-        framesThisSecond += 1
-        let now = Date()
-        let dt = now.timeIntervalSince(lastTick)
-        if dt >= 1 {
-            currentFPS = Double(framesThisSecond) / dt
-            framesThisSecond = 0
-            lastTick = now
-        }
+        guard !stopped, !inFlight else { return }
+        inFlight = true
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        // 单个请求短超时：一帧拿不到就跳过一次，绝不拖住整个循环
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+            guard let self else { return }
+            defer { self.inFlight = false }
+            guard !self.stopped else { return }
+
+            if let e = err {
+                let ns = e as NSError
+                if ns.code != NSURLErrorCancelled {
+                    self.onError?("第 \(ns.code) 号错误：\(ns.localizedDescription)")
+                }
+                return
+            }
+            guard let http = resp as? HTTPURLResponse else { return }
+            if http.statusCode == 401 { self.onError?("令牌不对"); return }
+            guard http.statusCode == 200, let data, let img = UIImage(data: data) else { return }
+
+            DispatchQueue.main.async {
+                guard !self.stopped else { return }
+                self.onFrame?(img)
+            }
+        }.resume()
     }
 }
 
-/// 对话页顶部的可折叠小窗。
-///
-/// 三个状态：
-///   · 未连接 → 整块不出现（不占空间，不打扰）
-///   · 已连接但收起 → 一条细栏，点一下展开
-///   · 展开 → 16:9 的画面 + 收起按钮
-///
-/// 为什么不自动展开：用户可能只想聊天，不想每进一个会话就顶着一块视频。
 @MainActor
 struct PCScreenDock: View {
     @Environment(PCLink.self) private var link
