@@ -70,6 +70,9 @@ $si = [SigmaInput]
 switch ($Action) {
 
   'screen' {
+    # 只报当前屏幕尺寸，不做任何截图动作。
+    # 之前这里挂掉是因为调用时把 -Text/-Keys 等参数也传了进来，
+    # 而 Param 块里没有对应类型。现在只读尺寸，不碰其它参数。
     $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
     "{`"ok`":true,`"width`":$($b.Width),`"height`":$($b.Height),`"x`":$($b.X),`"y`":$($b.Y)}"
   }
