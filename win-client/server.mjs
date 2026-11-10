@@ -472,8 +472,8 @@ function ensureScreen() {
     ? [scriptPath]
     : ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath,
        '-Fps', String(CONFIG.screenFps || 12),
-       '-Quality', String(CONFIG.screenQuality || 55),
-       '-Scale', String(CONFIG.screenScale || 0.5)];
+       '-Quality', String(CONFIG.screenQuality || 70),
+       '-Scale', String(CONFIG.screenScale || 1.0)];
 
   const child = spawn(ps, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   let buf = Buffer.alloc(0);
