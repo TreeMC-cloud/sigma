@@ -1,0 +1,11 @@
+# Windows runner 默认 core.autocrlf=true，checkout 时会把 LF 换成 CRLF。
+# 但 server.mjs 里的内嵌常量是 LF —— 于是「同一份文件」在 Windows 上
+# 和常量差了一堆 \r，check-embedded 必然报不一致。
+# 这些文件必须一律 LF，跨平台才不会因为换行符打架。
+*.ps1   text eol=lf
+*.mjs   text eol=lf
+*.js    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
