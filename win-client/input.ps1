@@ -42,6 +42,11 @@ public class SigmaInput {
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, int d, IntPtr e);
   [DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, uint f, IntPtr e);
   [DllImport("user32.dll")] public static extern short VkKeyScan(char ch);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int pid);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int max);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
 
   public const uint LEFTDOWN = 0x0002, LEFTUP = 0x0004;
@@ -52,6 +57,13 @@ public class SigmaInput {
 }
 '@
 }
+
+# ⚠ DPI 感知必须在**任何**坐标相关调用之前设置。
+# 高分屏 125%/150% 缩放下，不声明的进程拿到的是「逻辑像素」，
+# 而我们算坐标用的是截图的物理像素——两边差一截，点击就会偏。
+# PER_MONITOR_AWARE_V2 = -4；失败就退回旧 API（老系统）。
+try { [void][SigmaInput]::SetProcessDpiAwarenessContext([IntPtr](-4)) }
+catch { try { [void][SigmaInput]::SetProcessDPIAware() } catch { } }
 
 $si = [SigmaInput]
 
@@ -141,6 +153,73 @@ switch ($Action) {
     # 支持 "CTRL+V"、"ENTER"、"ALT+TAB" 这种组合
     [System.Windows.Forms.SendKeys]::SendWait($Keys)
     "{`"ok`":true,`"keys`":`"$Keys`"}"
+  }
+
+  'keydown' {
+    # 按下不松（长按用）。必须配 'keyup' 或看门狗释放，
+    # 否则 Ctrl/Alt 卡住会让整个系统没法用。
+    $map = @{
+      'ctrl'=0x11; 'alt'=0x12; 'shift'=0x10; 'win'=0x5B
+      'tab'=0x09; 'esc'=0x1B; 'enter'=0x0D; 'space'=0x20
+      'up'=0x26; 'down'=0x28; 'left'=0x25; 'right'=0x27
+    }
+    $k = $Keys.ToLower()
+    if (-not $map.ContainsKey($k)) { "{`"ok`":false,`"error`":`"不支持的键: $Keys`"}"; exit 1 }
+    [SigmaInput]::keybd_event([byte]$map[$k], 0, 0, [IntPtr]::Zero)
+    "{`"ok`":true,`"held`":`"$k`"}"
+  }
+
+  'keyup' {
+    $map = @{
+      'ctrl'=0x11; 'alt'=0x12; 'shift'=0x10; 'win'=0x5B
+      'tab'=0x09; 'esc'=0x1B; 'enter'=0x0D; 'space'=0x20
+      'up'=0x26; 'down'=0x28; 'left'=0x25; 'right'=0x27
+    }
+    $k = $Keys.ToLower()
+    if (-not $map.ContainsKey($k)) { "{`"ok`":false,`"error`":`"不支持的键: $Keys`"}"; exit 1 }
+    [SigmaInput]::keybd_event([byte]$map[$k], 0, $si::KEYUP, [IntPtr]::Zero)
+    "{`"ok`":true,`"released`":`"$k`"}"
+  }
+
+  'foreground' {
+    $h = [SigmaInput]::GetForegroundWindow()
+    $sb = New-Object System.Text.StringBuilder 512
+    [void][SigmaInput]::GetWindowTextW($h, $sb, 512)
+    $pid_ = 0
+    [void][SigmaInput]::GetWindowThreadProcessId($h, [ref]$pid_)
+    $pname = ''
+    try { $pname = (Get-Process -Id $pid_ -ErrorAction SilentlyContinue).ProcessName } catch { }
+    "{`"ok`":true,`"hwnd`":`"$h`",`"title`":`"$($sb.ToString())`",`"process`":`"$pname`",`"pid`":$pid_}"
+  }
+
+  'focus' {
+    # 按标题（模糊）或进程名激活窗口。找不到就报错，不瞎点。
+    if (-not $Text) { "{`"ok`":false,`"error`":`"需要 -Text 指定标题或进程名`"}"; exit 1 }
+    $target = Get-Process | Where-Object {
+      $_.MainWindowTitle -and ($_.MainWindowTitle -like "*$Text*" -or $_.ProcessName -like "*$Text*")
+    } | Select-Object -First 1
+    if (-not $target) { "{`"ok`":false,`"error`":`"找不到窗口: $Text`"}"; exit 1 }
+    # 用 WScript.Shell 的 AppActivate 最省事，按 PID 激活
+    try {
+      $ws = New-Object -ComObject WScript.Shell
+      [void]$ws.AppActivate($target.Id)
+      Start-Sleep -Milliseconds 200
+      "{`"ok`":true,`"hwnd`":`"$($target.MainWindowHandle)`",`"title`":`"$($target.MainWindowTitle)`"}"
+    } catch {
+      "{`"ok`":false,`"error`":`"激活失败: $($_.Exception.Message)`"}"
+    }
+  }
+
+  'release_all' {
+    # 紧急释放：把所有可能卡住的修饰键和鼠标键全部抬起。
+    # 用户觉得「键盘坏了」时，跑这一条就能恢复。
+    foreach ($vk in 0x10,0x11,0x12,0x5B,0x5C) {
+      [SigmaInput]::keybd_event([byte]$vk, 0, $si::KEYUP, [IntPtr]::Zero)
+    }
+    foreach ($f in $si::LEFTUP, $si::RIGHTUP, $si::MIDDLEUP) {
+      [SigmaInput]::mouse_event($f, 0, 0, 0, [IntPtr]::Zero)
+    }
+    "{`"ok`":true,`"released`":`"all`"}"
   }
 
   default {
