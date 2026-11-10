@@ -1129,8 +1129,21 @@ const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST') { json(res, 405, { ok: false, error: '只支持 POST' }); return; }
 
     const body = await readBody(req);
-    const fn = CAPS[route];
-    if (typeof fn !== 'function') { json(res, 404, { ok: false, error: `没有这个能力：${route}` }); return; }
+
+    // ⚠ 路由名是短横线（download-status），CAPS 上的方法名是驼峰（downloadStatus）。
+    // 直接 `CAPS[route]` 查不到，返回「没有这个能力」——真机日志里
+    // `pc.mjs download-status` 就是这么挂的，而 pc.mjs 侧完全看不出问题。
+    //
+    // 统一规则：短横线转驼峰再查一次。这样两边命名习惯不同也不会漏。
+    const camel = route.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    const fn = CAPS[route] || CAPS[camel];
+    if (typeof fn !== 'function') {
+      // 列出现有能力，比一句「没有这个能力」有用得多
+      const avail = Object.keys(CAPS).filter((k) => typeof CAPS[k] === 'function');
+      json(res, 404, { ok: false, error: `没有这个能力：${route}`,
+        available: avail });
+      return;
+    }
 
     const data = await fn(body);
     json(res, 200, { ok: true, data });
