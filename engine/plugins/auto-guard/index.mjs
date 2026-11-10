@@ -735,6 +735,9 @@ ctx.effect(() => {
     } catch { /* 记不下就算了 */ }
     const s = this.runtime(session);
     s.turns += 1;
+    // 新一轮开始：重置长任务静默计时
+    s.busySince = Date.now();
+    s.silenceWarned = false;
 
 
     // 子智能体的轮次不进飞行记录：用户在界面上看不到那些子会话，
@@ -1547,7 +1550,40 @@ ctx.effect(() => {
     } catch { return null; }
   }
 
+  /**
+   * 长任务静默检测。
+   *
+   * 真机日志里，模型在电脑上跑 10 分钟的烘焙，全程一句话不说。
+   * 用户问三次「咋样了」，最后直接打断（ABORTED 出现 3 次）。
+   *
+   * 这里没法「替它说话」，但可以每 90 秒提醒一次它自己报进度。
+   * 提醒只发一次（每次静默期），不刷屏。
+   */
+  checkLongSilence(session) {
+    try {
+      const s = this.runtime(session);
+      const now = Date.now();
+      const last = s.lastToolAt || now;
+      const busySince = s.busySince || now;
+
+      // 连续工具调用超过 90 秒且没给用户任何汇报
+      if (now - busySince > 90_000 && !s.silenceWarned) {
+        s.silenceWarned = true;
+        this.notify(
+          `已经连续干活 ${Math.round((now - busySince) / 1000)} 秒没跟用户说话了。`
+          + `长任务（烘焙、渲染、下载）中途报一句进度，比闷头做完再汇报好得多——`
+          + `哪怕只是「AO 烘焙进行中，预计还要 8 分钟」。`,
+          { kind: 'note', session: sessionId(session) }
+        );
+      }
+      // 用户有新输入或任务告一段落时重置
+      s.lastToolAt = now;
+    } catch { /* 检测失败不影响主流程 */ }
+  }
+
   onToolResult(session, event) {
+    this.checkLongSilence(session);
+
     // 检测「盲等」：sleep N（N>=10）然后才干活。
     // 真机日志里模型反复 `sleep 60; ps Get-Process`，等一分钟不知道中间发生了什么。
     // 正确做法是「动作 → 立刻看 → 再决定」。这里给它一个提醒。
