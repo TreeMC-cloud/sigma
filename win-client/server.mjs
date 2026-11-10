@@ -221,22 +221,28 @@ function connectRelay() {
     handleTunnelChunk(Buffer.from(evt.data));
   });
 
-  ws.addEventListener('close', () => {
+  // 重连：**只要不是主动关的，就一直重连**。
+  //
+  // 原来的条件只在 online/connecting 时重连，而 relayState 会被
+  // 'error' 事件先改成 'error' —— 于是「启动时中继正好重启」这种情况下
+  // 客户端永远不再尝试，界面上看是「已安装但连不上」，而且没提示。
+  let closedByUs = false;
+  const scheduleRetry = () => {
+    if (closedByUs) return;
     relayWS = null;
     closeTunnel();
-    if (relayState === 'online' || relayState === 'connecting') {
-      relayState = 'off';
-      // 断了就重连：客户可能长时间开着，网络抖一下就永久失联太糟
-      setTimeout(connectRelay, 5000);
-    }
-  });
+    relayState = 'off';
+    setTimeout(() => { if (!relayWS) connectRelay(); }, 5000);
+  };
 
+  ws.addEventListener('close', scheduleRetry);
   ws.addEventListener('error', (e) => {
     relayState = 'error';
     relayError = (e && e.message) || '连不上中继（网络被拦？）';
-    // 打出来：用户看不到的话，出问题只能干猜
-    console.log(`  中继    连接失败：${relayError}`);
+    console.log(`  中继    连接失败：${relayError}（5 秒后重试）`);
   });
+  // 主动断开（进程退出）时不重连
+  process.on('exit', () => { closedByUs = true; });
 
   relayWS = ws;
 }
