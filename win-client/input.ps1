@@ -210,6 +210,20 @@ switch ($Action) {
     }
   }
 
+  'screenshot' {
+    # 截全屏存到临时目录，返回路径。手机端拿去显示。
+    # 注意：当前模型未必支持图像输入，所以同时返回尺寸和大小，便于文字核对。
+    $out = if ($Text) { $Text } else { Join-Path $env:TEMP "sigma-shot-$(Get-Date -Format 'yyyyMMddHHmmss').png" }
+    $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size)
+    $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+    $g.Dispose(); $bmp.Dispose()
+    $sz = (Get-Item $out).Length
+    "{`"ok`":true,`"path`":`"$out`",`"width`":$($b.Width),`"height`":$($b.Height),`"bytes`":$sz}"
+  }
+
   'release_all' {
     # 紧急释放：把所有可能卡住的修饰键和鼠标键全部抬起。
     # 用户觉得「键盘坏了」时，跑这一条就能恢复。
