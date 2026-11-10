@@ -287,6 +287,13 @@ function renderBanner() {}
 // 生命周期：第一个观看者连上才启动 PowerShell，最后一个断开就杀掉。
 //   不让它常驻——没人看的时候一直抓屏是白烧 CPU 和电。
 
+// 1x1 白色 JPEG（最小的合法 JPEG，105 字节）。
+// 用途：流刚建立时先吐一帧，保证响应头马上离开缓冲区。
+const PLACEHOLDER_JPEG = Buffer.from(
+  '/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a'
+  + 'HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAA'
+  + 'AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==', 'base64');
+
 let screenProc = null;
 let screenInfo = null;      // { w, h, fps }
 let screenClients = new Set();
@@ -475,7 +482,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const auth = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    // 令牌可以放 Header，也可以放查询串 `?token=`。
+    // 后者是为了能在浏览器里直接排查（浏览器没法设 Header）——
+    // 局域网/中继都是明文 HTTP，多一个入口不会降低多少安全性，
+    // 但排障时省掉一大圈。
+    let auth = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    if (!auth) auth = url.searchParams.get('token') || '';
     if (!tokenOk(auth)) { json(res, 401, { ok: false, error: '令牌不对' }); return; }
 
     if (route === 'info') { json(res, 200, { ok: true, data: await CAPS.info() }); return; }
@@ -493,11 +505,13 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, {
         'content-type': 'multipart/x-mixed-replace; boundary=frame',
         'cache-control': 'no-store, no-cache, must-revalidate',
-        connection: 'close',
         'access-control-allow-origin': '*',
       });
+      // 立刻发一个 1x1 的占位 JPEG：不写任何字节的话，
+      // 上游（中继、iOS 的 URLSession）会认为「请求挂了但没响应」而超时。
+      // 这个占位帧让响应头立刻流出，真正的画面随后覆盖。
+      res.write(PLACEHOLDER_JPEG, () => {});
       screenClients.add(res);
-      // 新连接先给最后一帧，避免等 1/fps 秒才看到画面
       if (screenFrame) res.write(screenFrame, () => {});
       req.on('close', () => { screenClients.delete(res); stopScreenIfIdle(); });
       return;
