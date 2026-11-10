@@ -108,41 +108,68 @@ function proxyThrough(hostSocket, rawRequest, res) {
   const st = hostSocket.__st;
   if (!st || st.closed) { res.writeHead(502); res.end('电脑断开了'); return; }
 
-  let chunks = [];
-  const onData = (buf) => {
-    chunks.push(buf.toString('latin1'));
-    const all = chunks.join('');
-    // 判断响应结束：Content-Length 到齐，或 chunked 的结束块
-    const sep = all.indexOf('\r\n\r\n');
-    if (sep < 0) return;
-    const headers = all.slice(0, sep);
-    const m = /content-length:\s*(\d+)/i.exec(headers);
-    const bodyStart = sep + 4;
-    if (m) {
-      const need = Number(m[1]);
-      if (Buffer.byteLength(all.slice(bodyStart), 'latin1') < need) return;
-    } else if (!/transfer-encoding:\s*chunked/i.test(headers)) {
-      // 没有长度也没有 chunked：以连接关闭为准，这里没法等，只能等超时
-    } else if (!all.slice(bodyStart).includes('\r\n0\r\n')) {
-      return;
-    }
-    cleanup();
-    const raw = Buffer.from(all, 'latin1');
-    const sp = raw.indexOf('\r\n');
-    const status = Number((raw.slice(0, sp).toString().split(' ')[1]) || 200);
-    res.writeHead(status, { 'content-type': (/(?:^|\r\n)content-type:\s*([^\r\n]+)/i.exec(headers) || [,'application/octet-stream'])[1].trim() });
-    res.end(raw.slice(bodyStart));
+  let head = Buffer.alloc(0);
+  let sentHead = false;
+  let need = -1;        // Content-Length 剩余
+  let got = 0;
+
+  const finish = () => {
+    clearTimeout(timer);
+    st.stream = null;
+    if (!res.writableEnded) res.end();
   };
 
-  const timer = setTimeout(() => { cleanup(); if (!res.writableEnded) { res.writeHead(504); res.end('电脑没响应'); } }, 20000);
-  function cleanup() {
-    clearTimeout(timer);
-    st.extraData = null;
-  }
+  // 超时只对「还没收到响应头」的情况生效。
+  // 收到头之后是流（比如 MJPEG），本来就不该有结束时间。
+  const timer = setTimeout(() => {
+    if (!sentHead) { st.stream = null; res.writeHead(504); res.end('电脑没响应'); }
+  }, 20000);
 
-  st.extraData = onData;
+  st.stream = (buf) => {
+    if (!sentHead) {
+      head = Buffer.concat([head, buf]);
+      const sep = head.indexOf('\r\n\r\n');
+      if (sep < 0) {
+        if (head.length > 64 * 1024) { res.writeHead(502); res.end('响应头异常'); st.stream = null; }
+        return;
+      }
+      const headerText = head.subarray(0, sep).toString('latin1');
+      const body = head.subarray(sep + 4);
+      const sp = headerText.indexOf('\r\n');
+      const status = Number((headerText.slice(0, sp).split(' ')[1]) || 200);
+      const outHeaders = {};
+      for (const line of headerText.slice(sp + 2).split('\r\n')) {
+        const i = line.indexOf(':');
+        if (i < 0) continue;
+        const k = line.slice(0, i).trim().toLowerCase();
+        const v = line.slice(i + 1).trim();
+        if (k === 'content-length') { need = Number(v); continue; }
+        // 逐跳头不能透传：中继自己会重新分帧
+        if (['connection', 'transfer-encoding', 'keep-alive'].includes(k)) continue;
+        outHeaders[k] = v;
+      }
+      // 流式响应不带 Content-Length：交给 HTTP 的 chunked 编码
+      res.writeHead(status, outHeaders);
+      sentHead = true;
+      if (body.length) {
+        res.write(body);
+        got += body.length;
+      }
+      if (need >= 0 && got >= need) finish();
+      return;
+    }
+    res.write(buf);
+    got += buf.length;
+    if (need >= 0 && got >= need) finish();
+  };
+
+  // App 那边断开（比如用户收起小窗）：告诉负责的请求别再写了
+  res.on('close', () => {
+    if (st.stream) { st.stream = null; clearTimeout(timer); }
+  });
+
   try { hostSocket.write(frame(rawRequest, 0x2)); }
-  catch { cleanup(); res.writeHead(502); res.end('转发失败'); }
+  catch { st.stream = null; clearTimeout(timer); res.writeHead(502); res.end('转发失败'); }
 }
 
 // ── 状态 ──────────────────────────────────────────────────────────────
@@ -215,7 +242,10 @@ const server = http.createServer((req, res) => {
 
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, hosts: hosts.size, stat, at: new Date().toISOString() }));
+    // codes 打码只露前 2 位：/health 不需要鉴权，不能把配对码全公开。
+    // 排查时够用来核对「用户说的是不是同一个码」。
+    const codes = [...hosts.keys()].map((c) => c.slice(0, 2) + '****');
+    res.end(JSON.stringify({ ok: true, hosts: hosts.size, codes, stat, at: new Date().toISOString() }));
     return;
   }
   res.writeHead(426, { 'content-type': 'text/plain' });
@@ -277,8 +307,8 @@ function attach(socket) {
       // 已配对：字节原样转给对面。不解析——host 上是 HTTP，
       // 我们只当管道，任何解析都会引入新问题。
       stat.framesIn += 1;
-      // HTTP 入口的响应：交给等待中的请求
-      if (st.extraData) { st.extraData(f.payload); continue; }
+      // HTTP 入口的响应：交给等待中的请求（流式，可能来很多块）
+      if (st.stream) { st.stream(f.payload); continue; }
       if (st.peer) {
         stat.framesFwd += 1;
         if (stat.sample.length < 8) {
