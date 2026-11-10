@@ -222,6 +222,18 @@ try {
   } else if (cmd === 'downloads') {
     const d = await call(need(), 'downloads', {});
     for (const j of d.jobs) console.log(`${j.id} ${j.status} ${(j.bytes/1048576).toFixed(1)}MB ${j.path}`);
+  } else if (cmd === 'fetch') {
+    // 把电脑上的文件（截图、日志、产物）取回本地，存到 --out 指定的路径。
+    // 之前没有这个命令，模型只能用 read 硬拉二进制，
+    // 结果 151KB 的 PNG 被截断、还会把 $env:TEMP 当成字面量。
+    const remote = pos[0];
+    const out = arg('--out');
+    if (!remote || !out) throw new Error('用法：fetch <远端路径> --out <本地路径>');
+    const d = await call(need(), 'read', { path: remote, maxBytes: 8 * 1024 * 1024, base64: true });
+    const buf = Buffer.from(d.content || '', 'base64');
+    fs.writeFileSync(out, buf);
+    console.log(`已取回 ${remote}`);
+    console.log(`→ ${out}（${(buf.length/1024).toFixed(0)} KB${d.truncated ? '，已截断' : ''}）`);
   } else if (cmd === 'shot' || cmd === 'screenshot') {
     // 截一张全屏图，返回路径 + 尺寸 + 字节数。
     // 模型不支持图像输入，所以「看图」这条路走不通——
