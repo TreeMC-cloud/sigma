@@ -90,18 +90,21 @@ struct PCScreenView: View {
         }
         status = .connecting
         let r = MJPEGReceiver(url: url, token: token)
-        r.onFrame = { image in
-            // 主线程更新 UI；fps 用简单滑动平均，避免数字乱跳
-            DispatchQueue.main.async {
-                frame = image
-                status = .live
-                fps = fps == 0 ? r.currentFPS : fps * 0.8 + r.currentFPS * 0.2
+        // `@State` 是 MainActor 隔离的。闭包在后台线程跑，
+        // 用 DispatchQueue.main.async 在 Swift 6 严格并发下仍会报
+        // 「main actor-isolated property cannot be mutated from a Sendable closure」。
+        // `Task { @MainActor in ... }` 是唯一能让编译器认的写法。
+        r.onFrame = { [self] image in
+            Task { @MainActor in
+                self.frame = image
+                self.status = .live
+                self.fps = self.fps == 0 ? r.currentFPS : self.fps * 0.8 + r.currentFPS * 0.2
             }
         }
-        r.onError = { message in
-            DispatchQueue.main.async {
-                status = .failed(message)
-                frame = nil
+        r.onError = { [self] message in
+            Task { @MainActor in
+                self.status = .failed(message)
+                self.frame = nil
             }
         }
         r.start()
