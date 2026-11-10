@@ -215,35 +215,38 @@ final class MJPEGReceiver: NSObject, URLSessionDataDelegate {
 
     /// 从 buffer 里切出完整帧。
     ///
-    /// 格式：`--boundary\r\n...headers...\r\n\r\n<jpeg bytes>\r\n`
-    /// 我们只关心最后一个 `\r\n\r\n` 之后、下一个 boundary 之前的字节 —— 那就是 JPEG。
+    /// **不依赖 multipart 边界**。实测客户端发来的是
+    /// `605c\r\n<JPEG bytes>605c\r\n<JPEG bytes>...`
+    /// —— 长度用的是十六进制文本 + CRLF，而不是标准的 `--boundary` 分隔。
+    /// 按 boundary 切永远切不出来，界面就永远停在「连接中」。
+    ///
+    /// JPEG 的结构是确定的：`FF D8` 开头，`FF D9` 结尾。按这个切最稳，
+    /// 也不怕将来服务端换分帧方式。
+    private static let soi = Data([0xFF, 0xD8])
+    private static let eoi = Data([0xFF, 0xD9])
+
     private func extractFrames() {
         while true {
-            guard let start = buffer.range(of: boundary) else {
-                // 还没碰到边界：保留尾部一小段防止边界被切断
-                if buffer.count > 4 { buffer = buffer.suffix(4) }
+            // 1) 找到帧起点
+            guard let start = buffer.range(of: Self.soi) else {
+                // 没有起点：保留最后 1 字节（0xFF 可能被切开）
+                if buffer.count > 1 { buffer = buffer.suffix(1) }
                 return
             }
-            // 丢掉边界之前的内容（可能是上次的尾巴）
-            buffer.removeSubrange(0..<start.upperBound)
-            // 找这一帧的头部结束位置
-            guard let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) else {
-                if buffer.count > 512 { buffer.removeAll() }   // 异常数据，别无限涨
+            if start.lowerBound > buffer.startIndex {
+                buffer.removeSubrange(buffer.startIndex..<start.lowerBound)
+            }
+            // 2) 从起点之后找帧终点 FFD9
+            let afterSoi = buffer.index(buffer.startIndex, offsetBy: 2)
+            guard let end = buffer.range(of: Self.eoi, in: afterSoi..<buffer.endIndex) else {
+                // 还没收完。但要防止垃圾数据无限增长
+                if buffer.count > 4 * 1024 * 1024 { buffer.removeAll() }
                 return
             }
-            let bodyStart = headerEnd.upperBound
-            // 找下一帧的边界
-            guard let next = buffer.range(of: boundary, in: bodyStart..<buffer.endIndex) else {
-                return  // 帧还没收完
-            }
-            var jpeg = buffer.subdata(in: bodyStart..<next.lowerBound)
-            // 去掉边界前的 \r\n
-            while jpeg.count >= 2, jpeg[jpeg.count-2] == 0x0D, jpeg[jpeg.count-1] == 0x0A {
-                jpeg.removeLast(2)
-            }
-            buffer.removeSubrange(0..<next.lowerBound)
+            let jpeg = buffer.subdata(in: buffer.startIndex..<end.upperBound)
+            buffer.removeSubrange(buffer.startIndex..<end.upperBound)
 
-            if jpeg.count > 2, jpeg[0] == 0xFF, jpeg[1] == 0xD8, let img = UIImage(data: jpeg) {
+            if jpeg.count > 100, let img = UIImage(data: jpeg) {
                 tick()
                 onFrame?(img)
             }
