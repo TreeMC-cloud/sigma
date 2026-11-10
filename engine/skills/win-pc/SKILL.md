@@ -122,6 +122,29 @@ node "$DSH_TOOLS/win-pc/pc.mjs" connect --code <配对码> --token <令牌>
 
 除此之外，**自己想办法、自己验证、自己修**。卡住时先换一条路，不要停下来等。
 
+## 临时文件只放临时目录
+
+真机日志里用户的 `C:\Users\Administrator\` 根目录被塞了 `wins.ps1`、`mesa\`、
+`_sigma_shot.png`（桌面）。**用户的用户目录不是你的工作区。**
+
+规矩：
+
+| 要写什么 | 写到哪里 |
+|---|---|
+| 临时脚本（.ps1/.bat） | `$env:TEMP\sigma-xxx.ps1` |
+| 下载的安装包 | `$env:USERPROFILE\Downloads\` |
+| 解压出来的工具 | `$env:LOCALAPPDATA\sigma-tools\` |
+| 截图 | `$env:TEMP\`（`pc.mjs shot` 已经这么做了） |
+| **绝对不要** | `C:\Users\<用户>\` 根目录、桌面 |
+
+写完临时脚本要在收尾时删掉：
+
+```sh
+pc.mjs ps "Remove-Item '$env:TEMP\sigma-*.ps1' -Force -ErrorAction SilentlyContinue"
+```
+
+**用户看到自己桌面 / 用户目录多出一堆不认识的文件，会觉得这软件很脏。**
+
 ## 别在手机上替电脑试
 
 **成果要在电脑上，就在电脑上做。** 手机（iSH）和电脑是两条完全不同的网络
@@ -189,6 +212,44 @@ preview.mjs open 报告.pdf --go
 | 文字结果 | 直接写在回复里 |
 
 **别让用户自己去电脑上找文件。** 他人在手机上，看不到那台电脑的桌面。
+
+## 复杂 PowerShell 写成文件，别硬塞进命令行
+
+真机日志里反复卡在这一类：
+
+```sh
+# 写的时候自以为没问题
+pc.mjs ps "$b=[IO.File]::ReadAllBytes('C:\x'); $b[0..5]"
+# 实际执行时 $b 被吃掉，返回空
+# 而 run 里更要命：cmd 把每个 $ 都当字面量
+pc.mjs run "powershell -Command $f=... "   →  =[IO.File]::OpenRead(...)   ← $f 没了
+```
+
+**穿四层转义（bash → JSON → cmd → PowerShell）几乎必错。**
+
+正确做法：**写成本地 .ps1 文件，用 `psfile` 传过去。**
+
+```sh
+cat > /tmp/check.ps1 <<'PSEOF'
+$b = [System.IO.File]::ReadAllBytes('C:\downloads\x.7z')
+$b[0..5] -join ','
+PSEOF
+pc.mjs psfile /tmp/check.ps1
+```
+
+文件里的 `$`、引号、反引号**一个都不用转义**。
+
+**只有一行、不含变量的简单命令**才用 `pc.mjs ps "..."`。
+
+### 拿到空输出要当回事
+
+```
+工具完成 · ok · header=
+```
+
+`ok` 只代表进程退出码是 0，**不代表命令做对了**。
+返回空值、只有一个换行、或明显缺字段时，先怀疑「变量没传进去 / 路径不存在」，
+不要继续往下走——否则后面全建在错误前提上。
 
 ## 每一步都要「看」一眼，不要盲等
 
