@@ -182,7 +182,21 @@ function proxyThrough(hostSocket, rawRequest, res) {
       // multipart/x-mixed-replace 是无长度流：必须保持连接开着，
       // 不能因为「没有 content-length」就当成已结束。
       const isStream = /multipart\/x-mixed-replace/i.test(outHeaders['content-type'] || '');
+      // 显式关掉 Nagle 和分块缓冲：MJPEG 每帧都很小，
+      // 默认的 chunked 聚合会把它们攒到一定大小才发，
+      // 而 iOS 的 URLSession 在收到第一个 chunk 之前不会回调 didReceive。
+      if (isStream) {
+        outHeaders['cache-control'] = 'no-store';
+        outHeaders['x-accel-buffering'] = 'no';
+        // 别伪造 content-length：URLSession 会一直等满那个长度，
+        // 反而让「收到了却不解码」变成「永远等不到」。
+        // 流式走 chunked 是对的；App 那边改用 /screen/one 轮询。
+        try { res.socket && res.socket.setNoDelay(true); } catch {}
+      }
       res.writeHead(status, outHeaders);
+      // 立刻把响应头推出去，不等第一块 body。
+      // 不调用它的话，Node 会把头和数据一起攒着，客户端只能干等。
+      try { res.flushHeaders && res.flushHeaders(); } catch {}
       sentHead = true;
       if (body.length) { res.write(body); got += body.length; }
       if (!isStream && need >= 0 && got >= need) finish();
