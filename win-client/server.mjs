@@ -191,6 +191,26 @@ function resolveEmbedded(name, content) {
  * 只记结构化摘要，不记可能含密码的明文（打字内容只记长度）。
  * 日志在 exe 同目录的 audit.log，一行一条 JSON，方便 grep/转发。
  */
+/**
+ * 清掉 PowerShell 塞进 stderr 的 CLIXML 序列化块。
+ *
+ * 用 `-EncodedCommand` + 重定向时，PowerShell 会把错误/进度对象序列化成
+ * `#< CLIXML ... <Objs Version="1.1.0.1" ...>...</Objs>` 这样的 XML，
+ * 混在正常输出里非常难看，也让模型误判「有错误」。
+ *
+ * 只删这一段，真正的 stderr 文本保留。
+ */
+function stripClixml(text) {
+  if (typeof text !== 'string' || !text.includes('CLIXML')) return text;
+  return text
+    // 去掉整段 <Objs ...>...</Objs>
+    .replace(/#< CLIXML[\s\S]*?<\/Objs>/g, '')
+    // 去掉残留的单行标记
+    .replace(/^#< CLIXML\s*$/gm, '')
+    .replace(/<Objs[\s\S]*?<\/Objs>/g, '')
+    .trim();
+}
+
 function audit(entry) {
   try {
     const line = JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n';
@@ -228,6 +248,7 @@ let relayState = 'off';
 let relayError = null;
 const tunnels = new Map();   // rid -> { sock }
 let pendingRid = null;
+let currentRid = null;
 
 function sendText(obj) {
   if (relayWS && relayWS.readyState === 1) relayWS.send(JSON.stringify(obj));
@@ -287,25 +308,31 @@ function connectRelay() {
           console.log(`  中继    已上线（配对码 ${CONFIG.code}）`);
         } else if (msg.type === 'req') {
           pendingRid = msg.rid;
+        } else if (msg.type === 'end') {
+          if (currentRid === msg.rid) currentRid = null;
         } else if (msg.type === 'reset') {
           closeAllTunnels();
         }
       } catch { /* 非 JSON：丢弃 */ }
       return;
     }
-    // 二进制：如果刚收到 req，说明这是新的 HTTP 请求
+    // 二进制帧：属于当前 rid。
+    //
+    // 中继可能把一个 HTTP 请求拆成**多个** WebSocket 帧发过来
+    // （请求头一帧、body 一帧，或大 body 分几帧）。
+    // 之前只在收到 req 后的第一帧写进 TCP，后续帧被丢弃 ——
+    // 客户端拿到 Content-Length 比实际 body 大的请求，一直等剩下的字节，
+    // 最后超时。表现就是「GET 能通、POST 全超时」。
     const buf = Buffer.from(evt.data);
     if (pendingRid !== null) {
-      const sock = openTunnelFor(pendingRid);
+      const rid = pendingRid;
       pendingRid = null;
-      try { sock.write(buf); } catch { /* 写失败，close 兜 */ }
-      return;
+      currentRid = rid;
+      openTunnelFor(rid);          // 建连接并登记
     }
-    // 否则是某个 rid 的后续数据（少见：请求体分片）
-    const last = [...tunnels.keys()].pop();
-    if (last !== undefined) {
-      const t = tunnels.get(last);
-      if (t) { try { t.sock.write(buf); } catch { /* 已断 */ } }
+    if (currentRid !== null) {
+      const t = tunnels.get(currentRid);
+      if (t) { try { t.sock.write(buf); } catch { /* 已断，close 会清 */ } }
     }
   });
 
@@ -573,7 +600,7 @@ const CAPS = {
           ok: !err,
           code: typeof err?.code === 'number' ? err.code : (err ? 1 : 0),
           stdout: String(stdout || '').slice(0, 400000),
-          stderr: String(stderr || '').slice(0, 40000),
+          stderr: stripClixml(String(stderr || '')).slice(0, 40000),
           ms: Date.now() - started,
         });
       });
@@ -623,7 +650,7 @@ const CAPS = {
     const started = Date.now();
     const result = await new Promise((resolve) => {
       execFile(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-EncodedCommand', encoded], {
+        '-OutputFormat', 'Text', '-EncodedCommand', encoded], {
         timeout: Math.min(Number(timeoutMs) || 120000, 300000),
         maxBuffer: 16 * 1024 * 1024,
         windowsHide: true,
@@ -632,7 +659,7 @@ const CAPS = {
           ok: !err,
           code: typeof err?.code === 'number' ? err.code : (err ? 1 : 0),
           stdout: String(stdout || '').slice(0, 400000),
-          stderr: String(stderr || '').slice(0, 40000),
+          stderr: stripClixml(String(stderr || '')).slice(0, 40000),
           ms: Date.now() - started,
         });
       });
