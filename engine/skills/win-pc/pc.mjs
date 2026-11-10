@@ -209,6 +209,16 @@ try {
     if (!url) throw new Error('用法：download <url> [保存路径]');
     const d = await call(need(), 'download', { url, path: pos[1] || null });
     console.log(`已下载 ${d.path}（${(d.bytes/1048576).toFixed(1)} MB，${(d.ms/1000).toFixed(0)} 秒）`);
+  } else if (cmd === 'download-status') {
+    const jobId = pos[0];
+    if (!jobId) throw new Error('用法：download-status <jobId>');
+    const d = await call(need(), 'download-status', { jobId });
+    const mb = (d.bytes/1048576).toFixed(1);
+    console.log(`${d.status} · ${mb} MB${d.error ? ' · ' + d.error : ''}`);
+    if (d.status === 'done') console.log(`已保存：${d.path}`);
+  } else if (cmd === 'downloads') {
+    const d = await call(need(), 'downloads', {});
+    for (const j of d.jobs) console.log(`${j.id} ${j.status} ${(j.bytes/1048576).toFixed(1)}MB ${j.path}`);
   } else if (cmd === 'audit') {
     const cfg = need();
     const url = cfg.url.replace(/\/+$/, '') + '/audit?n=' + (arg('--n') || 20);
