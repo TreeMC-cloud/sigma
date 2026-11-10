@@ -99,6 +99,63 @@ node "$DSH_TOOLS/win-pc/pc.mjs" connect --code <配对码> --token <令牌>
 **命令卡住多半在等输入。** 加 `/y`、`-Force`、`--yes` 这类参数；
 或者用 `ps` 而不是 `run`（PowerShell 不读 stdin 的概率低一些）。
 
+## 执行纪律：能自己解决的不许问用户
+
+用户给的是**指令**，不是**讨论**。说「装 QQ」，就是要装好，不是问「要不要装」。
+
+真机上这几件事反复发生，全都是自己给自己找麻烦：
+
+| 现象 | 正确做法 |
+|---|---|
+| 下载 403，去问用户怎么办 | **加 User-Agent 重试**（CDN 拒绝默认 UA）；再不行换镜像源 |
+| 命令里有引号导致 URL 错 | 用 `ps` 而不是 `run`——PowerShell 的 `-EncodedCommand` 不会碰引号 |
+| 不确定链对不对 | 先 `Invoke-WebRequest -Method Head` 验一下，不要盲点 |
+| 大文件超时 | 用 `pc.mjs download`（后台任务，立刻返回 jobId），别用 `run` 调 curl |
+| 不知道按钮在哪 | `pc.mjs ps` 调 UI Automation 读控件树，别凭坐标猜 |
+
+**只有这几种情况才问用户**：
+1. 需要他的账号密码（比如登录微信）
+2. 两个方案代价明显不同（删除 vs 保留）
+3. 环境根本不支持（比如没装显卡驱动却要跑 CUDA）
+
+除此之外，**自己想办法、自己验证、自己修**。卡住时先换一条路，不要停下来等。
+
+## 严禁过度工程
+
+真机日志里发生过：为了「下载 QQ」，模型去下载 msedgedriver、比对 Edge 版本、
+启动无头浏览器、用 WebDriver 点官网按钮——折腾了十几轮还没下完。
+
+**一个文件而已，不需要浏览器自动化。**
+
+正确的优先级：
+
+1. **直接 `download`**（客户端内置，带 UA、跟随跳转、后台任务）
+   ```sh
+   pc.mjs download "https://dldir1.qq.com/qqfile/qq/QQNT/Windows/QQ_9.9.37_241223_x64_01.exe"
+   pc.mjs download-status <jobId>      # 查进度
+   ```
+2. **拿不到直链** → `ps` 里 `Invoke-WebRequest` 抓官网 HTML，正则出 `.exe` 链接
+3. **官网要 JS 渲染** → 才考虑浏览器，而且只在**没有别的办法**时
+
+**任何时候不要在客户电脑上装驱动、装自动化框架。** 那是给测试环境用的。
+
+## 验证：做完要比对，不是发出去就算
+
+一条指令执行完，必须**确认结果真的发生了**：
+
+```sh
+# 装软件 → 查注册表/文件是否存在
+pc.mjs ps "Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where DisplayName -like '*QQ*' | Select DisplayName,DisplayVersion"
+
+# 下文件 → 查大小是否合理
+pc.mjs ps "Get-Item '$env:USERPROFILE\Downloads\*.exe' | Select Name,Length"
+
+# 改文件 → 读回来比对
+pc.mjs read "~/x.txt"
+```
+
+**「命令退出码 0」不等于「事情做成了」。** 你要的是后者。
+
 ## 三条铁律
 
 **1. 破坏性操作先问。** 删文件、卸软件、关机、改系统设置——先说清要做什么，等用户点头。
