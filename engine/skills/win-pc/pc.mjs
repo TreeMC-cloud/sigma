@@ -268,6 +268,54 @@ try {
     console.log(`已取回 ${remote}`);
     console.log(`→ ${out}（${(buf.length/1048576).toFixed(2)} MB${d.truncated ? '，已截断' : ''}）`);
     console.log(`minis://attachments/${name}`);
+  } else if (cmd === 'blend-start') {
+    // 启动 Blender 常驻 kernel。之后所有操作毫秒级返回，不再反复加载场景。
+    const d = await call(need(), 'blender-start', {
+      blend: pos[0] || arg('--blend') || '',
+      port: Number(arg('--port') || 9821),
+      gui: rest.includes('--gui'),
+    }, 90000);
+    console.log(`kernel 就绪 · 端口 ${d.port} · ${d.blend}${d.gui ? ' · 带界面' : ''}`);
+  } else if (cmd === 'blend-run') {
+    // 在 kernel 里跑 Python。脚本从文件读，避免命令行转义。
+    const f = pos[0];
+    if (!f) throw new Error('用法：blend-run <本地.py> 或 blend-run --code "..."');
+    const code = rest.includes('--code') ? pos.slice(1).join(' ') : fs.readFileSync(f, 'utf8');
+    const d = await call(need(), 'blender-run', { code, port: Number(arg('--port') || 9821) }, 180000);
+    if (d.out) process.stdout.write(d.out);
+    console.log(`（${d.ok ? 'ok' : '失败'} · ${d.ms}ms）`);
+    if (!d.ok) process.exitCode = 1;
+  } else if (cmd === 'blend-attach') {
+    // 把 B 贴到 A 上：武器贴手 / 配件贴面 / 家具贴地 / 灯具吊挂
+    //   blend-attach <A> <B> [--mode grip|surface|ground|hang] [--bone Hand.R]
+    //                [--gap 0] [--dry]
+    const a = pos[0], b = pos[1];
+    if (!a || !b) throw new Error('用法：blend-attach <A> <B> [--mode ...] [--bone ...]');
+    const d = await call(need(), 'blend-attach', {
+      a, b,
+      mode: arg('--mode') || 'grip',
+      bone: arg('--bone') || null,
+      gap: Number(arg('--gap') || 0),
+      dryRun: rest.includes('--dry'),
+      port: Number(arg('--port') || 9821),
+    }, 180000);
+    console.log(`${d.ok ? '✅' : '⚠️'} ${d.mode}: ${d.a} ← ${d.b}`);
+    console.log(`  移到 [${d.moved_to?.join(', ')}] · 旋转 [${d.rotated_by?.join(', ')}]°`);
+    if (d.final_gap !== undefined) console.log(`  最终间隙 ${d.final_gap} 米`);
+    for (const w of d.warnings || []) console.log(`  警告: ${w}`);
+  } else if (cmd === 'blend-audit') {
+    // 装配审计：五项几何检查，分级报告。
+    const d = await call(need(), 'blender-audit', { port: Number(arg('--port') || 9821) }, 180000);
+    const ok = d.gate;
+    console.log(ok ? '✅ 通过' : '❌ 有阻断问题，不允许交付');
+    if (d.blockers?.length) {
+      for (const b of d.blockers) console.log(`  [阻断] ${b.check}: ${b.count} 处`);
+    }
+    if (d.quality?.length) {
+      for (const q of d.quality) console.log(`  [质量] ${q.check}: ${q.count}`);
+    }
+    console.log(`  统计: ${d.stats.objects} 物体 / ${d.stats.polys} 面 / ${d.stats.materials} 材质`);
+    if (!ok) process.exitCode = 1;
   } else if (cmd === 'wait') {
     // 通用等待原语。任何「等它做完」的场景都用这个，不要 sleep。
     //   wait file_exists <路径>
