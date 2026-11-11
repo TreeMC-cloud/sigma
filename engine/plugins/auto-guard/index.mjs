@@ -1566,13 +1566,24 @@ ctx.effect(() => {
       const last = s.lastToolAt || now;
       const busySince = s.busySince || now;
 
-      // 连续工具调用超过 90 秒且没给用户任何汇报
-      if (now - busySince > 90_000 && !s.silenceWarned) {
+      // 两个触发条件，任一满足就提醒：
+      //   · 时间：连续 90 秒没说话（适合长任务：烘焙、渲染、下载）
+      //   · 次数：连续 8 次工具调用没说话（适合高频短操作：反复改脚本）
+      //
+      // 为什么需要第二条：真机日志里模型在 4 分钟内做了 6 次操作
+      // （neck.py → neck2.py → 改脚本 → 改脚本 → 重建 → 验证），
+      // 每次只隔 10 秒，永远触发不了「90 秒」，而用户看到的是「咋又卡住了」。
+      s.toolStreak = (s.toolStreak || 0) + 1;
+      const tooLong = now - busySince > 90_000;
+      const tooMany = s.toolStreak >= 8;
+      if ((tooLong || tooMany) && !s.silenceWarned) {
         s.silenceWarned = true;
+        const why = tooMany
+          ? `连续做了 ${s.toolStreak} 次操作没跟用户说话`
+          : `已经连续干活 ${Math.round((now - busySince) / 1000)} 秒没跟用户说话`;
         this.notify(
-          `已经连续干活 ${Math.round((now - busySince) / 1000)} 秒没跟用户说话了。`
-          + `长任务（烘焙、渲染、下载）中途报一句进度，比闷头做完再汇报好得多——`
-          + `哪怕只是「AO 烘焙进行中，预计还要 8 分钟」。`,
+          `${why}。用户看到的是「咋又卡住了」，而不是你的进展。`
+          + `每完成一个小阶段就报一句——哪怕只是「颈部已加长，接下来检查接缝」。`,
           { kind: 'note', session: sessionId(session) }
         );
       }
@@ -1582,6 +1593,14 @@ ctx.effect(() => {
   }
 
   onToolResult(session, event) {
+    // 只要模型给用户说了话，就重置「连续操作」计数。
+    // 这里借用事件里的 assistant 文本判断：有的话说明它刚汇报过。
+    try {
+      const s0 = this.runtime(session);
+      const said = event?.assistantText || event?.message || '';
+      if (said && String(said).trim()) s0.toolStreak = 0;
+    } catch { }
+
     this.checkLongSilence(session);
 
     // 检测「盲等」：sleep N（N>=10）然后才干活。
