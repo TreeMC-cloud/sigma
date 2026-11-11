@@ -861,17 +861,20 @@ const CAPS = {
           // BITS：断点续传、后台、系统级。比 Invoke-WebRequest 稳。
           // 很多下载站（含 qqdl.gtimg.cn）会拒掉没有 UA 的请求，直接 403。
           // BITS 不支持自定义 UA，改用 Invoke-WebRequest。
+          // ⚠ 用 curl.exe 而不是 Invoke-WebRequest。
+          //
+          // 真机日志的教训：Invoke-WebRequest -OutFile 会先下到临时文件、
+          // 完成后才移动到目标路径。所以下载过程中目标文件根本不存在，
+          // download-status 四次都报 `0.0 MB`，模型以为卡死，放弃了这个接口。
+          //
+          // curl.exe 直接往目标文件写，边下边长——downloadStatus 能读到真实进度。
+          // Windows 10 1803+ 自带 curl.exe，不需要额外安装。
           const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
             + '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-          const ps = `$ProgressPreference='SilentlyContinue';`
-            + `$ErrorActionPreference='Stop';`
-            + `Invoke-WebRequest -Uri '${url.replace(/'/g, "''")}' `
-            + `-OutFile '${dest.replace(/'/g, "''")}' `
-            + `-UserAgent '${ua}' -UseBasicParsing -MaximumRedirection 5`;
           await new Promise((resolve, reject) => {
-            execFile('powershell.exe',
-              ['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-OutputFormat','Text',
-               '-EncodedCommand', Buffer.from(ps,'utf16le').toString('base64')],
+            execFile('curl.exe',
+              ['-sSL', '--fail', '-A', ua, '-o', dest, url,
+               '--retry', '3', '--retry-delay', '2', '--max-time', '1500'],
               { timeout: 1800000, windowsHide: true, maxBuffer: 1024*1024 },
               (err, so, se) => err ? reject(new Error(String(se||err.message).slice(0,300))) : resolve());
           });
