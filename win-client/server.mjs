@@ -61,6 +61,15 @@ const EMBEDDED_SCREEN_PS1 = "# Sigma 屏幕采集 —— 持续输出 JPEG 帧�
 // 输入控制脚本，同样内嵌：exe 里一定拿得到。
 const EMBEDDED_INPUT_PS1 = "# Sigma 输入控制 —— 鼠标与键盘\n#\n# 为什么用 PowerShell 而不是 Node 原生模块：\n#   客户端的设计前提是「零依赖、单文件 exe」。SendInput/SetCursorPos 是\n#   user32.dll 里的 C 接口，Node 调不到；PowerShell 用 Add-Type 编译一小段\n#   P/Invoke 声明就能调，而且所有 Windows 都自带 PowerShell。\n#\n# 为什么每次调用起一个进程：\n#   鼠标点击是低频事件（人手操作），不像屏幕采集要连续跑。\n#   起进程约 200-400ms，对人机交互完全够用；常驻进程反而要维护 IPC 协议。\n#\n# 用法（参数形式）：\n#   powershell -File input.ps1 -Action move -X 100 -Y 200\n#   powershell -File input.ps1 -Action click -Button left\n#   powershell -File input.ps1 -Action type -Text \"你好\"\n#   powershell -File input.ps1 -Action key -Keys \"CTRL+V\"\n#   powershell -File input.ps1 -Action scroll -Delta -3\n#   powershell -File input.ps1 -Action screen      # 返回屏幕尺寸\n\nparam(\n  [Parameter(Mandatory = $true)][string]$Action,\n  [int]$X = 0,\n  [int]$Y = 0,\n  [string]$Button = 'left',\n  [string]$Text = '',\n  [string]$Keys = '',\n  [int]$Delta = 0,\n  [int]$MoveMs = 0\n)\n\n$ErrorActionPreference = 'Stop'\n\nAdd-Type -AssemblyName System.Windows.Forms\n\nif (-not ('SigmaInput' -as [type])) {\n  Add-Type -TypeDefinition @'\nusing System;\nusing System.Runtime.InteropServices;\npublic class SigmaInput {\n  [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int x, int y);\n  [DllImport(\"user32.dll\")] public static extern bool GetCursorPos(out POINT p);\n  [DllImport(\"user32.dll\")] public static extern void mouse_event(uint f, int dx, int dy, int d, IntPtr e);\n  [DllImport(\"user32.dll\")] public static extern void keybd_event(byte k, byte s, uint f, IntPtr e);\n  [DllImport(\"user32.dll\")] public static extern short VkKeyScan(char ch);\n  [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();\n  [DllImport(\"user32.dll\")] public static extern int GetWindowThreadProcessId(IntPtr h, out int pid);\n  [DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int max);\n  [DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();\n  [DllImport(\"user32.dll\")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);\n  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }\n\n  public const uint LEFTDOWN = 0x0002, LEFTUP = 0x0004;\n  public const uint RIGHTDOWN = 0x0008, RIGHTUP = 0x0010;\n  public const uint MIDDLEDOWN = 0x0020, MIDDLEUP = 0x0040;\n  public const uint WHEEL = 0x0800, HWHEEL = 0x1000;\n  public const uint KEYUP = 0x0002;\n}\n'@\n}\n\n# ⚠ DPI 感知必须在**任何**坐标相关调用之前设置。\n# 高分屏 125%/150% 缩放下，不声明的进程拿到的是「逻辑像素」，\n# 而我们算坐标用的是截图的物理像素——两边差一截，点击就会偏。\n# PER_MONITOR_AWARE_V2 = -4；失败就退回旧 API（老系统）。\ntry { [void][SigmaInput]::SetProcessDpiAwarenessContext([IntPtr](-4)) }\ncatch { try { [void][SigmaInput]::SetProcessDPIAware() } catch { } }\n\n$si = [SigmaInput]\n\nswitch ($Action) {\n\n  'screen' {\n    # 只报当前屏幕尺寸，不做任何截图动作。\n    # 之前这里挂掉是因为调用时把 -Text/-Keys 等参数也传了进来，\n    # 而 Param 块里没有对应类型。现在只读尺寸，不碰其它参数。\n    $b = [System.Windows.Forms.SystemInformation]::VirtualScreen\n    \"{`\"ok`\":true,`\"width`\":$($b.Width),`\"height`\":$($b.Height),`\"x`\":$($b.X),`\"y`\":$($b.Y)}\"\n  }\n\n  'pos' {\n    $p = New-Object SigmaInput+POINT\n    [void][SigmaInput]::GetCursorPos([ref]$p)\n    \"{`\"ok`\":true,`\"x`\":$($p.X),`\"y`\":$($p.Y)}\"\n  }\n\n  'move' {\n    # MoveMs > 0 时做平滑移动：很多程序（游戏、画板）只认连续移动事件，\n    # 瞬移会被忽略或当成拖拽。\n    if ($MoveMs -gt 0) {\n      $p = New-Object SigmaInput+POINT\n      [void][SigmaInput]::GetCursorPos([ref]$p)\n      $steps = [Math]::Max(6, [int]($MoveMs / 12))\n      for ($i = 1; $i -le $steps; $i++) {\n        $nx = [int]($p.X + ($X - $p.X) * $i / $steps)\n        $ny = [int]($p.Y + ($Y - $p.Y) * $i / $steps)\n        [void][SigmaInput]::SetCursorPos($nx, $ny)\n        Start-Sleep -Milliseconds ([Math]::Max(1, [int]($MoveMs / $steps)))\n      }\n    }\n    [void][SigmaInput]::SetCursorPos($X, $Y)\n    \"{`\"ok`\":true,`\"x`\":$X,`\"y`\":$Y}\"\n  }\n\n  'click' {\n    $down = $si::LEFTDOWN; $up = $si::LEFTUP\n    if ($Button -eq 'right')  { $down = $si::RIGHTDOWN;  $up = $si::RIGHTUP }\n    if ($Button -eq 'middle') { $down = $si::MIDDLEDOWN; $up = $si::MIDDLEUP }\n    [void][SigmaInput]::SetCursorPos($X, $Y)\n    Start-Sleep -Milliseconds 40\n    [SigmaInput]::mouse_event($down, 0, 0, 0, [IntPtr]::Zero)\n    Start-Sleep -Milliseconds 40\n    [SigmaInput]::mouse_event($up, 0, 0, 0, [IntPtr]::Zero)\n    \"{`\"ok`\":true,`\"button`\":`\"$Button`\",`\"x`\":$X,`\"y`\":$Y}\"\n  }\n\n  'dblclick' {\n    [void][SigmaInput]::SetCursorPos($X, $Y)\n    for ($i = 0; $i -lt 2; $i++) {\n      [SigmaInput]::mouse_event($si::LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)\n      [SigmaInput]::mouse_event($si::LEFTUP, 0, 0, 0, [IntPtr]::Zero)\n      Start-Sleep -Milliseconds 60\n    }\n    \"{`\"ok`\":true}\"\n  }\n\n  'down' {\n    [SigmaInput]::mouse_event($si::LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)\n    \"{`\"ok`\":true}\"\n  }\n\n  'up' {\n    [SigmaInput]::mouse_event($si::LEFTUP, 0, 0, 0, [IntPtr]::Zero)\n    \"{`\"ok`\":true}\"\n  }\n\n  'scroll' {\n    # Delta 单位是「格」，正数向上。Windows 的 wheel 参数是 120 的倍数。\n    [SigmaInput]::mouse_event($si::WHEEL, 0, 0, ($Delta * 120), [IntPtr]::Zero)\n    \"{`\"ok`\":true,`\"delta`\":$Delta}\"\n  }\n\n  'type' {\n    # 中文一律走剪贴板 + Ctrl+V。\n    #\n    # 为什么不直接 SendKeys：SendKeys 依赖当前键盘布局，中文机上是\n    # 美式布局 + 输入法，逐字符发送会被输入法吞掉或打出拼音。\n    # 剪贴板路径跟布局无关，中英混排也稳。\n    #\n    # 注意 $Text 本身的编码：脚本文件必须是 UTF-8（带 BOM），\n    # 否则 PowerShell 5 按 GBK 解析，中文字面量在加载时就坏了。\n    if ($Text -match '[^\\x00-\\x7F]') {\n      $prev = $null\n      try { $prev = Get-Clipboard -Raw } catch { }\n      Set-Clipboard -Value $Text\n      Start-Sleep -Milliseconds 150\n      [System.Windows.Forms.SendKeys]::SendWait('^v')\n      Start-Sleep -Milliseconds 80\n      # 尽量恢复用户原来的剪贴板，别把它覆盖掉\n      if ($null -ne $prev -and $prev.Length -lt 10000) {\n        try { Set-Clipboard -Value $prev } catch { }\n      }\n    } else {\n      [System.Windows.Forms.SendKeys]::SendWait($Text)\n    }\n    \"{`\"ok`\":true,`\"len`\":$($Text.Length)}\"\n  }\n\n  'key' {\n    # 支持 \"CTRL+V\"、\"ENTER\"、\"ALT+TAB\" 这种组合\n    [System.Windows.Forms.SendKeys]::SendWait($Keys)\n    \"{`\"ok`\":true,`\"keys`\":`\"$Keys`\"}\"\n  }\n\n  'keydown' {\n    # 按下不松（长按用）。必须配 'keyup' 或看门狗释放，\n    # 否则 Ctrl/Alt 卡住会让整个系统没法用。\n    $map = @{\n      'ctrl'=0x11; 'alt'=0x12; 'shift'=0x10; 'win'=0x5B\n      'tab'=0x09; 'esc'=0x1B; 'enter'=0x0D; 'space'=0x20\n      'up'=0x26; 'down'=0x28; 'left'=0x25; 'right'=0x27\n    }\n    $k = $Keys.ToLower()\n    if (-not $map.ContainsKey($k)) { \"{`\"ok`\":false,`\"error`\":`\"不支持的键: $Keys`\"}\"; exit 1 }\n    [SigmaInput]::keybd_event([byte]$map[$k], 0, 0, [IntPtr]::Zero)\n    \"{`\"ok`\":true,`\"held`\":`\"$k`\"}\"\n  }\n\n  'keyup' {\n    $map = @{\n      'ctrl'=0x11; 'alt'=0x12; 'shift'=0x10; 'win'=0x5B\n      'tab'=0x09; 'esc'=0x1B; 'enter'=0x0D; 'space'=0x20\n      'up'=0x26; 'down'=0x28; 'left'=0x25; 'right'=0x27\n    }\n    $k = $Keys.ToLower()\n    if (-not $map.ContainsKey($k)) { \"{`\"ok`\":false,`\"error`\":`\"不支持的键: $Keys`\"}\"; exit 1 }\n    [SigmaInput]::keybd_event([byte]$map[$k], 0, $si::KEYUP, [IntPtr]::Zero)\n    \"{`\"ok`\":true,`\"released`\":`\"$k`\"}\"\n  }\n\n  'foreground' {\n    $h = [SigmaInput]::GetForegroundWindow()\n    $sb = New-Object System.Text.StringBuilder 512\n    [void][SigmaInput]::GetWindowTextW($h, $sb, 512)\n    $pid_ = 0\n    [void][SigmaInput]::GetWindowThreadProcessId($h, [ref]$pid_)\n    $pname = ''\n    try { $pname = (Get-Process -Id $pid_ -ErrorAction SilentlyContinue).ProcessName } catch { }\n    \"{`\"ok`\":true,`\"hwnd`\":`\"$h`\",`\"title`\":`\"$($sb.ToString())`\",`\"process`\":`\"$pname`\",`\"pid`\":$pid_}\"\n  }\n\n  'focus' {\n    # 按标题（模糊）或进程名激活窗口。找不到就报错，不瞎点。\n    if (-not $Text) { \"{`\"ok`\":false,`\"error`\":`\"需要 -Text 指定标题或进程名`\"}\"; exit 1 }\n    $target = Get-Process | Where-Object {\n      $_.MainWindowTitle -and ($_.MainWindowTitle -like \"*$Text*\" -or $_.ProcessName -like \"*$Text*\")\n    } | Select-Object -First 1\n    if (-not $target) { \"{`\"ok`\":false,`\"error`\":`\"找不到窗口: $Text`\"}\"; exit 1 }\n    # 用 WScript.Shell 的 AppActivate 最省事，按 PID 激活\n    try {\n      $ws = New-Object -ComObject WScript.Shell\n      [void]$ws.AppActivate($target.Id)\n      Start-Sleep -Milliseconds 200\n      \"{`\"ok`\":true,`\"hwnd`\":`\"$($target.MainWindowHandle)`\",`\"title`\":`\"$($target.MainWindowTitle)`\"}\"\n    } catch {\n      \"{`\"ok`\":false,`\"error`\":`\"激活失败: $($_.Exception.Message)`\"}\"\n    }\n  }\n\n  'screenshot' {\n    # 截全屏存到临时目录，返回路径。手机端拿去显示。\n    #\n    # ⚠ 必须存到 $env:TEMP，不能落到桌面——真机日志里模型把\n    # `_sigma_shot.png` 写到了 C:\\Users\\Administrator\\Desktop，\n    # 用户桌面上凭空多出一堆垃圾文件。\n    $stamp = Get-Date -Format 'yyyyMMddHHmmss'\n    $out = if ($Text) { $Text } else { Join-Path $env:TEMP \"sigma-shot-$stamp.png\" }\n\n    # ⚠ DPI：2560x1288 的屏在 200% 缩放下，VirtualScreen 只报 1280x644。\n    # 以驱动层分辨率为准，否则只截到左上角 1/4。\n    $b = [System.Windows.Forms.SystemInformation]::VirtualScreen\n    try {\n      $vc = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |\n            Where-Object { $_.CurrentHorizontalResolution -gt 0 } | Select-Object -First 1\n      if ($vc -and $vc.CurrentHorizontalResolution -gt $b.Width) {\n        $b = New-Object System.Drawing.Rectangle(0, 0, [int]$vc.CurrentHorizontalResolution, [int]$vc.CurrentVerticalResolution)\n      }\n    } catch { }\n\n    $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height)\n    $g = [System.Drawing.Graphics]::FromImage($bmp)\n    $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size)\n    $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)\n    $g.Dispose(); $bmp.Dispose()\n    $sz = (Get-Item $out).Length\n    \"{`\"ok`\":true,`\"path`\":`\"$out`\",`\"width`\":$($b.Width),`\"height`\":$($b.Height),`\"bytes`\":$sz}\"\n  }\n\n  'release_all' {\n    # 紧急释放：把所有可能卡住的修饰键和鼠标键全部抬起。\n    # 用户觉得「键盘坏了」时，跑这一条就能恢复。\n    foreach ($vk in 0x10,0x11,0x12,0x5B,0x5C) {\n      [SigmaInput]::keybd_event([byte]$vk, 0, $si::KEYUP, [IntPtr]::Zero)\n    }\n    foreach ($f in $si::LEFTUP, $si::RIGHTUP, $si::MIDDLEUP) {\n      [SigmaInput]::mouse_event($f, 0, 0, 0, [IntPtr]::Zero)\n    }\n    \"{`\"ok`\":true,`\"released`\":`\"all`\"}\"\n  }\n\n  default {\n    \"{`\"ok`\":false,`\"error`\":`\"未知动作: $Action`\"}\"\n    exit 1\n  }\n}\n";
 
+// Blender 常驻 kernel：让连续的建模操作不用反复启动 Blender
+const EMBEDDED_BLENDER_KERNEL = '';   // 运行时从 blender/kernel_server.py 读，见 resolveEmbedded;
+
+// Blender 装配审计：把「浮空/穿模/无材质」变成可判定检查
+const EMBEDDED_BLENDER_AUDIT = '';   // 运行时从 blender/audit.py 读，见 resolveEmbedded;
+
+// 通用贴合：把武器贴手、配件贴面、家具贴地，一次算完
+const EMBEDDED_BLENDER_ATTACH = '';   // 运行时从 blender/attach.py 读，见 resolveEmbedded;
+
 const PORT = Number(process.env.SIGMA_WIN_PORT || 8092);
 const BEACON_PORT = Number(process.env.SIGMA_WIN_BEACON || 8099);
 const IS_WIN = process.platform === 'win32';
@@ -198,6 +207,11 @@ function lanAddresses() {
  * 需要一个真实路径——所以写到临时目录再用。文件名带 pid，避免多开冲突。
  */
 function resolveEmbedded(name, content) {
+  // .ps1 在根目录，Blender 的 .py 在 blender/ 子目录
+  for (const dir of [HERE, path.join(HERE, 'blender')]) {
+    const p = path.join(dir, name);
+    if (fs.existsSync(p)) return p;
+  }
   const beside = path.join(HERE, name);
   if (fs.existsSync(beside)) return beside;
   const tmp = path.join(os.tmpdir(), `sigma-${process.pid}-${name}`);
@@ -953,6 +967,132 @@ const CAPS = {
       await new Promise((r) => setTimeout(r, interval));
     }
     return { ok: true, met: false, waitedMs: Date.now() - started, detail };
+  },
+
+  /**
+   * 启动 Blender 常驻 kernel。
+   *
+   * 为什么值得：每次 `blender -b scene.blend -P cmd.py` 都要重新加载场景，
+   * 中等工程 30-60 秒。连续调试 20 步就是 20 分钟纯等待。
+   * 常驻之后每步只要几十毫秒。
+   *
+   * @param blend   要打开的 .blend 文件（空=空场景）
+   * @param port    kernel 端口，默认 9821
+   * @param gui     true = 带界面启动（能用 GUI 交互），false = 后台
+   */
+  async blendStart({ blend = '', port = 9821, gui = false } = {}) {
+    const ps = IS_WIN ? 'powershell.exe' : 'pwsh';
+    const script = resolveEmbedded('blender_kernel.py', EMBEDDED_BLENDER_KERNEL);
+    // 先确认端口没被占（重复启动会静默失败，查起来很费劲）
+    const probe = await new Promise((resolve) => {
+      const s = net.connect(port, '127.0.0.1');
+      s.on('connect', () => { s.destroy(); resolve(true); });
+      s.on('error', () => resolve(false));
+      s.setTimeout(800, () => { s.destroy(); resolve(false); });
+    });
+    if (probe) return { ok: true, already: true, port, hint: 'kernel 已在运行' };
+
+    const args = [
+      gui ? '' : '-b',
+      blend ? `"${blend.replace(/"/g, '\\"')}"` : '',
+      '-P', `"${script}"`, '--', '--port', String(port),
+    ].filter(Boolean).join(' ');
+
+    const blender = CONFIG.blenderPath || 'blender';
+    const cmd = `Start-Process -FilePath '${blender}' -ArgumentList '${args.replace(/'/g, "''")}' -WindowStyle ${gui ? 'Normal' : 'Hidden'}`;
+
+    const r = await new Promise((resolve) => {
+      execFile(ps, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command',
+        Buffer.from(cmd, 'utf16le').toString('base64').length ? cmd : cmd],
+        { timeout: 20000, windowsHide: true }, (err, so, se) => resolve({ err: err?.message, so, se }));
+    });
+    if (r.err) throw new Error('启动 Blender 失败：' + r.err);
+
+    // 等 kernel 端口就绪（最多 60 秒：大场景加载慢）
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+      const up = await new Promise((resolve) => {
+          const s = net.connect(port, '127.0.0.1');
+        s.on('connect', () => { s.destroy(); resolve(true); });
+        s.on('error', () => resolve(false));
+        s.setTimeout(500, () => { s.destroy(); resolve(false); });
+      });
+      if (up) return { ok: true, port, blend: blend || '(空场景)', gui };
+      await new Promise((r2) => setTimeout(r2, 1000));
+    }
+    throw new Error('Blender 启动了但 kernel 端口 60 秒内没就绪（场景可能太大，或 Blender 路径不对）');
+  },
+
+  /**
+   * 在常驻 kernel 里跑一段 Python。毫秒级返回，不重启 Blender。
+   */
+  async blendRun({ code, port = 9821, timeoutMs = 120000 } = {}) {
+    if (!code || typeof code !== 'string') throw new Error('缺少 code');
+    return await new Promise((resolve, reject) => {
+      const sock = net.connect(port, '127.0.0.1');
+      let buf = '';
+      const tid = setTimeout(() => { sock.destroy(); reject(new Error('kernel 无响应（超时）')); }, timeoutMs);
+      sock.on('connect', () => {
+        sock.write(JSON.stringify({ id: 1, code }) + '\n');
+      });
+      sock.on('data', (d) => {
+        buf += d.toString('utf8');
+        const nl = buf.indexOf('\n');
+        if (nl < 0) return;
+        clearTimeout(tid);
+        try {
+          const resp = JSON.parse(buf.slice(0, nl));
+          resolve(resp);
+        } catch (e) { reject(new Error('kernel 返回的不是 JSON')); }
+        sock.destroy();
+      });
+      sock.on('error', (e) => { clearTimeout(tid); reject(new Error('连不上 kernel（Blender 开着吗？）：' + e.message)); });
+    });
+  },
+
+  /**
+   * 装配审计：跑五项几何检查，返回分级报告。
+   * gate=false 表示有阻断级问题，不允许交付。
+   */
+  async blendAudit({ port = 9821, polyLimit = 2000000 } = {}) {
+    const boot = `
+import json as _json, sys as _sys
+_audit_src = ${JSON.stringify(EMBEDDED_BLENDER_AUDIT)}
+_ns = {}
+exec(compile(_audit_src, '<audit>', 'exec'), _ns)
+_print = _ns['audit_all'](poly_limit=${Number(polyLimit)})
+print(_json.dumps(_print, ensure_ascii=False))
+`.trim();
+    const r = await this.blendRun({ code: boot, port });
+    if (!r.ok) throw new Error('审计执行失败：' + (r.out || '').slice(0, 400));
+    const line = String(r.out || '').trim().split('\n').pop();
+    try { return JSON.parse(line); }
+    catch { throw new Error('审计输出无法解析：' + String(r.out).slice(0, 300)); }
+  },
+
+  /**
+   * 通用贴合：把 B 装到 A 上（武器贴手 / 配件贴面 / 家具贴地 / 灯具吊挂）。
+   * dryRun=true 只返回计算计划，不动场景。
+   */
+  async blendAttach({ a, b, mode = 'grip', bone = null, offset = [0,0,0],
+                      gap = 0, alignRotation = true, dryRun = false, port = 9821 } = {}) {
+    const boot = `
+import json as _json
+_attach_src = ${JSON.stringify(EMBEDDED_BLENDER_ATTACH)}
+_ns = {}
+exec(compile(_attach_src, '<attach>', 'exec'), _ns)
+_r = _ns['attach'](${JSON.stringify(a)}, ${JSON.stringify(b)},
+    mode=${JSON.stringify(mode)}, bone=${bone ? JSON.stringify(bone) : 'None'},
+    offset=tuple(${JSON.stringify(offset)}), gap=${Number(gap)},
+    align_rotation=${alignRotation ? 'True' : 'False'},
+    dry_run=${dryRun ? 'True' : 'False'})
+print(_json.dumps(_r, ensure_ascii=False))
+`.trim();
+    const r = await this.blendRun({ code: boot, port });
+    if (!r.ok) throw new Error('贴合失败：' + (r.out || '').slice(0, 400));
+    const line = String(r.out || '').trim().split('\n').pop();
+    try { return JSON.parse(line); }
+    catch { throw new Error('贴合输出无法解析：' + String(r.out).slice(0, 300)); }
   },
 
   async downloadStatus({ jobId } = {}) {
